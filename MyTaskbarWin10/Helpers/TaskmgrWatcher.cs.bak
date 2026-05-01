@@ -1,0 +1,371 @@
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TaskmgrWatcher — хелпер для определения запущенного Диспетчера задач
+//                  и получения его имени процесса БЕЗ прав администратора.
+//
+// ПРОБЛЕМА (оригинальная):
+//   taskmgr.exe запускается с повышенными привилегиями (High/System IL).
+//   Process.GetProcessById(pid).ProcessName бросает Win32Exception (Access Denied)
+//   для привилегированных процессов — и SafeGetProcessName возвращает "",
+//   из-за чего окно taskmgr игнорируется в EnumWindows.
+//
+// РЕШЕНИЕ (оригинальное):
+//   OpenProcess с PROCESS_QUERY_LIMITED_INFORMATION (0x1000) — этот флаг
+//   разрешён ЛЮБОМУ процессу для ЛЮБОГО другого, независимо от уровня
+//   целостности (IL). Затем QueryFullProcessImageName даёт полный путь
+//   к EXE без чтения памяти процесса.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// [FIX-TASKMGR-FOCUS] БЛОКИРОВКА ОРИГИНАЛЬНОГО ПУСКА
+// ─────────────────────────────────────────────────────────────────────────────
+// ПРОБЛЕМА:
+//   Когда taskmgr (High IL) является foreground-окном и пользователь нажимает
+//   Win-key, Shell открывает оригинальный Пуск через внутренний IPC-канал с
+//   задержкой ~80-150мс — в обход LowLevel keyboard hook нашего приложения.
+//   Это происходит потому что Shell проверяет IL foreground-процесса и при
+//   High IL использует привилегированный путь открытия Пуска.
+//
+// РЕШЕНИЕ:
+//   Постоянный WinEvent хук на EVENT_SYSTEM_FOREGROUND (0x0003).
+//   Срабатывает мгновенно при КАЖДОЙ смене foreground-окна в системе.
+//   Как только TaskManagerWindow получает фокус — немедленно уводим его
+//   на Progman (рабочий стол, Medium IL). Shell никогда не видит
+//   foreground == High IL, поэтому IPC-канал открытия Пуска не активируется.
+//
+// КАК ПОДКЛЮЧИТЬ (в MainWindow.xaml.cs):
+//   // При старте (например, в StartTaskbarWatcher):
+//   TaskmgrWatcher.StartFocusGuard();
+//
+//   // При закрытии (в Unload/OnClosed):
+//   TaskmgrWatcher.StopFocusGuard();
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace MyTaskbar.Helpers
+{
+    public static class TaskmgrWatcher
+    {
+        // ── P/Invoke ──────────────────────────────────────────────────────────
+
+        const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+        // EVENT_SYSTEM_MOVESIZE* — посылаются когда окно начинает/заканчивает move/resize.
+        // Используем для точного определения drag без гонки с GetAsyncKeyState.
+        const uint EVENT_SYSTEM_MOVESIZESTART = 0x000A;
+        const uint EVENT_SYSTEM_MOVESIZEEND   = 0x000B;
+
+        // EVENT_SYSTEM_FOREGROUND — посылается системой при смене foreground-окна.
+        // Приходит раньше чем Shell успевает обработать Win-key через IPC.
+        const uint EVENT_SYSTEM_FOREGROUND = 0x0003;
+        const uint WINEVENT_OUTOFCONTEXT   = 0x0000;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool QueryFullProcessImageName(
+            IntPtr hProcess,
+            uint dwFlags,
+            [Out] StringBuilder lpExeName,
+            ref uint lpdwSize);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+        [DllImport("user32.dll")]
+        static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern IntPtr SetWinEventHook(
+            uint eventMin, uint eventMax,
+            IntPtr hmodWinEventProc,
+            WinEventDelegate lpfnWinEventProc,
+            uint idProcess, uint idThread,
+            uint dwFlags);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool UnhookWinEvent(IntPtr hWinEventHook);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("kernel32.dll")]
+        static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("user32.dll")]
+        static extern bool AllowSetForegroundWindow(uint dwProcessId);
+        const uint ASFW_ANY = 0xFFFFFFFF;
+
+        delegate void WinEventDelegate(
+            IntPtr hWinEventHook, uint eventType, IntPtr hwnd,
+            int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+        // ── Состояние FocusGuard ──────────────────────────────────────────────
+
+        static IntPtr           _focusGuardHook     = IntPtr.Zero;
+        static WinEventDelegate _focusGuardDelegate;  // держим ссылку — иначе GC уберёт
+
+        // Хук EVENT_SYSTEM_MOVESIZE* — следит за drag/resize taskmgr.
+        // Пока _taskmgrMoving == true — StealFocus не вызывается.
+        static IntPtr           _moveSizeHook        = IntPtr.Zero;
+        static WinEventDelegate _moveSizeDelegate;
+        static volatile bool    _taskmgrMoving       = false;
+
+        static System.Windows.Threading.DispatcherTimer _pollTimer;
+
+        // ── FocusGuard: публичный API ─────────────────────────────────────────
+
+        /// <summary>
+        /// Запускает постоянный мониторинг foreground-окна.
+        /// Слой 1: WinEvent EVENT_SYSTEM_FOREGROUND — мгновенная реакция при смене окна.
+        /// Слой 2: DispatcherTimer 200мс — перехватывает клики/drag внутри уже активного taskmgr.
+        /// ВАЖНО: вызывать из UI-потока (STA с message loop).
+        /// SetForegroundWindow работает только из потока у которого есть право на foreground —
+        /// им является UI-поток приложения, поэтому оба слоя должны работать в нём.
+        /// </summary>
+        /// <param name="dispatcher">Dispatcher UI-потока (передать Application.Current.Dispatcher)</param>
+        public static void StartFocusGuard(System.Windows.Threading.Dispatcher dispatcher)
+        {
+            if (_focusGuardHook != IntPtr.Zero) return; // уже запущен
+
+            // Слой 1: хук EVENT_SYSTEM_FOREGROUND — мгновенная реакция при смене окна
+            _focusGuardDelegate = OnForegroundChanged;
+            _focusGuardHook = SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                IntPtr.Zero, _focusGuardDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+            // Слой 2: хук EVENT_SYSTEM_MOVESIZE* — точный флаг drag/resize taskmgr.
+            // Когда флаг поднят — StealFocus не вызывается, окно можно тащить свободно.
+            _moveSizeDelegate = OnMoveSizeEvent;
+            _moveSizeHook = SetWinEventHook(
+                EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND,
+                IntPtr.Zero, _moveSizeDelegate, 0, 0, WINEVENT_OUTOFCONTEXT);
+
+            // Слой 3: DispatcherTimer — перехватывает фокус после отпускания кнопки
+            _pollTimer = new System.Windows.Threading.DispatcherTimer(
+                System.Windows.Threading.DispatcherPriority.Normal,
+                dispatcher)
+            {
+                Interval = TimeSpan.FromMilliseconds(200)
+            };
+            _pollTimer.Tick += (s, e) =>
+            {
+                try
+                {
+                    // Не трогаем фокус пока идёт drag/resize
+                    if (_taskmgrMoving) return;
+                    IntPtr fg = GetForegroundWindow();
+                    if (fg != IntPtr.Zero && IsTaskmgrHwnd(fg))
+                        StealFocus();
+                }
+                catch { }
+            };
+            _pollTimer.Start();
+        }
+
+        /// <summary>
+        /// Останавливает мониторинг foreground-окна и освобождает ресурсы.
+        /// Вызывать при закрытии приложения.
+        /// </summary>
+        public static void StopFocusGuard()
+        {
+            if (_focusGuardHook == IntPtr.Zero && _pollTimer == null) return;
+
+            try { UnhookWinEvent(_focusGuardHook); } catch { }
+            _focusGuardHook     = IntPtr.Zero;
+            _focusGuardDelegate = null;
+
+            try { UnhookWinEvent(_moveSizeHook); } catch { }
+            _moveSizeHook     = IntPtr.Zero;
+            _moveSizeDelegate = null;
+            _taskmgrMoving    = false;
+
+            try { _pollTimer?.Stop(); } catch { }
+            _pollTimer = null;
+        }
+
+        // ── Внутренние методы ─────────────────────────────────────────────────
+
+        // WinEvent callback для EVENT_SYSTEM_FOREGROUND.
+        static void OnForegroundChanged(
+            IntPtr hHook, uint eventType, IntPtr hwnd,
+            int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        {
+            try
+            {
+                if (hwnd == IntPtr.Zero) return;
+                if (!IsTaskmgrHwnd(hwnd)) return;
+                // Не трогаем фокус если идёт drag/resize
+                if (_taskmgrMoving) return;
+                StealFocus();
+            }
+            catch { }
+        }
+
+        // WinEvent callback для EVENT_SYSTEM_MOVESIZESTART / EVENT_SYSTEM_MOVESIZEEND.
+        // Поднимает/опускает флаг _taskmgrMoving только для окон taskmgr.
+        static void OnMoveSizeEvent(
+            IntPtr hHook, uint eventType, IntPtr hwnd,
+            int idObject, int idChild, uint dwEventThread, uint dwmsEventTime)
+        {
+            try
+            {
+                if (hwnd == IntPtr.Zero) return;
+                if (!IsTaskmgrHwnd(hwnd)) return;
+                _taskmgrMoving = (eventType == EVENT_SYSTEM_MOVESIZESTART);
+                // Когда drag закончен — сразу снимаем фокус
+                if (!_taskmgrMoving)
+                    StealFocus();
+            }
+            catch { }
+        }
+
+        // Проверяет, принадлежит ли hwnd диспетчеру задач по window class.
+        // Не требует прав администратора, работает для любой локализации.
+        static bool IsTaskmgrHwnd(IntPtr hwnd)
+        {
+            var sb = new StringBuilder(256);
+            GetClassName(hwnd, sb, sb.Capacity);
+            string cls = sb.ToString();
+            // TaskManagerWindow — основное окно taskmgr Win10/Win11
+            // TaskMgrRebar      — дочерний rebar Win10 taskmgr
+            return cls == "TaskManagerWindow" || cls == "TaskMgrRebar";
+        }
+
+        // Уводит foreground на Progman (рабочий стол, Medium IL).
+        //
+        // Почему обычный SetForegroundWindow не работает:
+        //   taskmgr работает на High IL. Windows блокирует смену foreground
+        //   из Medium IL процесса через foreground lock. AllowSetForegroundWindow +
+        //   keybd_event тоже не помогают — они работают только если наш процесс
+        //   УЖЕ является foreground в момент вызова.
+        //
+        // Решение — AttachThreadInput:
+        //   Присоединяем наш поток к очереди ввода потока taskmgr.
+        //   После этого Windows считает что мы "часть" того же контекста ввода
+        //   и разрешает SetForegroundWindow без проверки IL и foreground lock.
+        //   Сразу после вызова — detach.
+        static void StealFocus()
+        {
+            try
+            {
+                IntPtr desktop = FindWindow("Progman", null);
+                if (desktop == IntPtr.Zero) return;
+
+                IntPtr taskmgrHwnd = FindWindow("TaskManagerWindow", null);
+                if (taskmgrHwnd == IntPtr.Zero) return;
+
+                uint taskmgrTid = GetWindowThreadProcessId(taskmgrHwnd, out _);
+                uint myTid      = GetCurrentThreadId();
+
+                AllowSetForegroundWindow(ASFW_ANY);
+
+                bool attached = (taskmgrTid != 0 && taskmgrTid != myTid)
+                    && AttachThreadInput(myTid, taskmgrTid, true);
+                try
+                {
+                    SetForegroundWindow(desktop);
+                }
+                finally
+                {
+                    if (attached)
+                        AttachThreadInput(myTid, taskmgrTid, false);
+                }
+            }
+            catch { }
+        }
+
+        // ── Публичные методы (оригинальные) ──────────────────────────────────
+
+        /// <summary>
+        /// Возвращает имя процесса (без расширения, lower) по PID,
+        /// используя PROCESS_QUERY_LIMITED_INFORMATION.
+        /// Работает без прав администратора даже для SYSTEM-процессов.
+        /// Возвращает "" если PID не найден или произошла ошибка.
+        /// </summary>
+        public static string GetProcessNameByPid(uint pid)
+        {
+            if (pid == 0) return "";
+
+            IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (hProc == IntPtr.Zero) return "";
+
+            try
+            {
+                var sb = new StringBuilder(260);
+                uint size = (uint)sb.Capacity;
+                if (!QueryFullProcessImageName(hProc, 0, sb, ref size))
+                    return "";
+
+                string fullPath = sb.ToString(0, (int)size);
+                if (string.IsNullOrEmpty(fullPath)) return "";
+
+                string fileName = System.IO.Path.GetFileNameWithoutExtension(fullPath);
+                return fileName?.ToLowerInvariant() ?? "";
+            }
+            catch
+            {
+                return "";
+            }
+            finally
+            {
+                CloseHandle(hProc);
+            }
+        }
+
+        /// <summary>
+        /// Проверяет, запущен ли taskmgr прямо сейчас.
+        /// </summary>
+        public static bool IsTaskManagerRunning()
+        {
+            IntPtr hwnd = FindWindow("TaskManagerWindow", null);
+            if (hwnd != IntPtr.Zero) return true;
+            hwnd = FindWindow(null, "Диспетчер задач");
+            if (hwnd != IntPtr.Zero) return true;
+            hwnd = FindWindow(null, "Task Manager");
+            return hwnd != IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Запускает Диспетчер задач без прав администратора.
+        /// </summary>
+        public static void LaunchTaskManager()
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("ms-taskmgr:")
+                {
+                    UseShellExecute = true
+                };
+                System.Diagnostics.Process.Start(psi);
+                return;
+            }
+            catch { }
+
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("taskmgr.exe")
+                {
+                    UseShellExecute = true
+                };
+                System.Diagnostics.Process.Start(psi);
+            }
+            catch { }
+        }
+    }
+}

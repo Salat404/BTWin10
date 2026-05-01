@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
@@ -260,7 +261,14 @@ namespace MyTaskbar.Helpers
             if (fallback != null) return fallback;
 
             // 11. UWP AppxManifest
-            return TryUwpPackageIcon(path, size);
+            var uwpResult = TryUwpPackageIcon(path, size);
+            if (uwpResult != null) return uwpResult;
+
+            // 12. Steam librarycache — универсальный fallback для любых Steam-игр.
+            //     Работает даже если exe не содержит иконку (tf_win64.exe, hl2.exe и т.п.)
+            //     Путь к exe обычно: ...steamapps\common\<GameName>\<sub>\game.exe
+            //     appcache\librarycache\<appid>_icon.jpg лежит рядом с steam.exe
+            return TrySteamLibraryCacheIcon(path, size);
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -995,7 +1003,7 @@ namespace MyTaskbar.Helpers
             {
                 IntPtr h = LoadImage(IntPtr.Zero, icoPath, IMAGE_ICON, desiredSize, desiredSize, LR_LOADFROMFILE);
                 if (h == IntPtr.Zero) return null;
-                var bmp = FromHIcon(h); DestroyIcon(h); return bmp;
+                var bmp = FromHIcon(h, desiredSize); DestroyIcon(h); return bmp;
             }
             catch { return null; }
         }
@@ -1023,14 +1031,33 @@ namespace MyTaskbar.Helpers
         // ══════════════════════════════════════════════════════════════
         //  КОНВЕРТЕРЫ HANDLE → BitmapSource
         // ══════════════════════════════════════════════════════════════
-        private static BitmapSource FromHIcon(IntPtr hIcon)
+        private static BitmapSource FromHIcon(IntPtr hIcon, int size = 0)
         {
             try
             {
                 var bmp = Imaging.CreateBitmapSourceFromHIcon(
                     hIcon, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
-                if (bmp != null && bmp.CanFreeze) bmp.Freeze();
-                return bmp;
+                if (bmp == null) return null;
+                // [FIX-ICON-DPI] Нормализуем DPI к 96: иконки с нестандартным DPI (72, 120, 144...)
+                // выглядят растянутыми в WPF Image-элементе.
+                int targetW = size > 0 ? size : bmp.PixelWidth;
+                int targetH = size > 0 ? size : bmp.PixelHeight;
+                BitmapSource result;
+                if (bmp.DpiX != 96.0 || bmp.DpiY != 96.0 || bmp.PixelWidth != targetW || bmp.PixelHeight != targetH)
+                {
+                    var tb = new TransformedBitmap();
+                    tb.BeginInit();
+                    tb.Source = bmp;
+                    tb.Transform = new System.Windows.Media.ScaleTransform(
+                        (double)targetW / bmp.PixelWidth,
+                        (double)targetH / bmp.PixelHeight);
+                    tb.EndInit();
+                    result = tb;
+                }
+                else
+                    result = bmp;
+                if (result != null && result.CanFreeze) result.Freeze();
+                return result;
             }
             catch { return null; }
         }
@@ -1069,6 +1096,118 @@ namespace MyTaskbar.Helpers
                 return xml.Substring(i, j - i).Trim();
             }
             catch { return null; }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  STEAM LIBRARY CACHE — универсальный fallback для игр Steam
+        //  Работает для любой игры без хардкода app-id:
+        //    1. Ищем steam_appid.txt рядом с exe (или на 3 уровня вверх)
+        //    2. Если нет — ищем appmanifest_*.acf в steamapps и
+        //       сравниваем installdir с путём к exe
+        //    3. По найденному appid берём appcache\librarycache\<id>_icon.jpg
+        // ══════════════════════════════════════════════════════════════
+        private static BitmapSource TrySteamLibraryCacheIcon(string exePath, int size)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(exePath)) return null;
+
+                // Определяем папку Steam из реестра
+                string steamPath = null;
+                using (var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\WOW6432Node\Valve\Steam")
+                               ?? Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Valve\Steam"))
+                {
+                    steamPath = key?.GetValue("InstallPath") as string;
+                }
+                if (string.IsNullOrEmpty(steamPath) || !Directory.Exists(steamPath))
+                    return null;
+
+                string appId = null;
+
+                // Шаг 1: ищем steam_appid.txt рядом с exe (до 4 уровней вверх)
+                string dir = Path.GetDirectoryName(exePath) ?? "";
+                for (int depth = 0; depth < 4 && !string.IsNullOrEmpty(dir); depth++)
+                {
+                    string appIdFile = Path.Combine(dir, "steam_appid.txt");
+                    if (File.Exists(appIdFile))
+                    {
+                        string content = File.ReadAllText(appIdFile).Trim();
+                        if (!string.IsNullOrEmpty(content) && content.All(char.IsDigit))
+                        {
+                            appId = content;
+                            break;
+                        }
+                    }
+                    dir = Path.GetDirectoryName(dir) ?? "";
+                }
+
+                // Шаг 2: если нет steam_appid.txt — ищем через appmanifest_*.acf
+                if (appId == null)
+                {
+                    // Собираем все библиотечные папки Steam (libraryfolders.vdf)
+                    var libraryRoots = new List<string> { steamPath };
+                    string vdfPath = Path.Combine(steamPath, "steamapps", "libraryfolders.vdf");
+                    if (File.Exists(vdfPath))
+                    {
+                        string vdf = File.ReadAllText(vdfPath);
+                        // Парсим строки вида  "path"   "D:\\SteamLibrary"
+                        foreach (System.Text.RegularExpressions.Match m in
+                            System.Text.RegularExpressions.Regex.Matches(
+                                vdf, "\"path\"\\s+\"([^\"]+)\"",
+                                System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                        {
+                            string libPath = m.Groups[1].Value.Replace("\\\\", "\\");
+                            if (Directory.Exists(libPath) && !libraryRoots.Contains(libPath))
+                                libraryRoots.Add(libPath);
+                        }
+                    }
+
+                    string exeNorm = exePath.Replace('/', '\\').ToLowerInvariant();
+
+                    foreach (string libRoot in libraryRoots)
+                    {
+                        string appsDir = Path.Combine(libRoot, "steamapps");
+                        if (!Directory.Exists(appsDir)) continue;
+                        foreach (string acf in Directory.GetFiles(appsDir, "appmanifest_*.acf"))
+                        {
+                            try
+                            {
+                                string acfContent = File.ReadAllText(acf);
+                                // Читаем appid и installdir
+                                var mId = System.Text.RegularExpressions.Regex.Match(
+                                    acfContent, "\"appid\"\\s+\"(\\d+)\"",
+                                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                var mDir = System.Text.RegularExpressions.Regex.Match(
+                                    acfContent, "\"installdir\"\\s+\"([^\"]+)\"",
+                                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                if (!mId.Success || !mDir.Success) continue;
+
+                                string installDir = Path.Combine(appsDir, "common", mDir.Groups[1].Value);
+                                if (!exeNorm.StartsWith(installDir.ToLowerInvariant())) continue;
+
+                                appId = mId.Groups[1].Value;
+                                break;
+                            }
+                            catch { }
+                        }
+                        if (appId != null) break;
+                    }
+                }
+
+                if (appId == null) return null;
+
+                // Шаг 3: ищем иконку в appcache\librarycache
+                string cacheDir = Path.Combine(steamPath, "appcache", "librarycache");
+                foreach (string ext in new[] { "_icon.jpg", "_icon.png", "_logo.png" })
+                {
+                    string iconPath = Path.Combine(cacheDir, appId + ext);
+                    if (!File.Exists(iconPath)) continue;
+                    var bmp = LoadBitmapFile(iconPath);
+                    if (bmp != null) return bmp;
+                }
+            }
+            catch { }
+            return null;
         }
 
         // ══════════════════════════════════════════════════════════════

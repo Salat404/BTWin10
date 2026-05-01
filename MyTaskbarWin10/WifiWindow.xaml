@@ -1,4 +1,4 @@
-﻿<Window x:Class="MyTaskbar.WifiWindow"
+<Window x:Class="MyTaskbar.WifiWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="WifiWindow"
@@ -13,8 +13,8 @@
 
     <Border x:Name="RootBorder"
             Background="Transparent"
-            BorderBrush="#33FFFFFF"
-            BorderThickness="1,0,0,1">
+            BorderBrush="#22FFFFFF"
+            BorderThickness="0,1,0,1">
 
         <Grid>
             <Grid.RowDefinitions>
@@ -59,13 +59,13 @@
 
                     <TextBlock x:Name="ConnectedSsidLabel"
                                Grid.Column="1" Grid.Row="0"
-                               Text="Сеть"
+                               Text="Network"
                                Foreground="White" FontSize="13"
                                FontWeight="SemiBold" FontFamily="Segoe UI"/>
 
                     <TextBlock x:Name="ConnectedStatusLabel"
                                Grid.Column="1" Grid.Row="1"
-                               Text="Подключено, защищено"
+                               Text="Connected, secured"
                                Foreground="#AAAAAA" FontSize="11" FontFamily="Segoe UI"/>
 
                     <StackPanel Grid.Column="1" Grid.Row="2"
@@ -75,7 +75,7 @@
                                 Cursor="Hand" Focusable="False" Padding="0">
                             <Button.Template>
                                 <ControlTemplate TargetType="Button">
-                                    <TextBlock x:Name="tb" Text="Свойства"
+                                    <TextBlock x:Name="tb" Text="Properties"
                                                Foreground="#5BA3E0" FontSize="11"
                                                FontFamily="Segoe UI" TextDecorations="Underline"/>
                                     <ControlTemplate.Triggers>
@@ -102,7 +102,7 @@
                     <Button.Template>
                         <ControlTemplate TargetType="Button">
                             <Border x:Name="bg" Background="#0078D4" Padding="14,5">
-                                <TextBlock Text="Отключиться" Foreground="White"
+                                <TextBlock Text="Disconnect" Foreground="White"
                                            FontSize="12" FontFamily="Segoe UI"/>
                             </Border>
                             <ControlTemplate.Triggers>
@@ -165,7 +165,7 @@
             <!-- Статус -->
             <TextBlock x:Name="StatusLabel"
                        Grid.Row="3"
-                       Text="Сканирование..."
+                       Text="Scanning..."
                        Foreground="#888888" FontSize="11" FontFamily="Segoe UI"
                        HorizontalAlignment="Center"
                        Margin="0,6,0,6" Visibility="Visible"/>
@@ -182,7 +182,7 @@
                     <Button.Template>
                         <ControlTemplate TargetType="Button">
                             <TextBlock x:Name="t1"
-                                       Text="Параметры сети и Интернет"
+                                       Text="Network &amp; Internet settings"
                                        Foreground="#5BA3E0" FontSize="12"
                                        FontFamily="Segoe UI" FontWeight="SemiBold"/>
                             <ControlTemplate.Triggers>

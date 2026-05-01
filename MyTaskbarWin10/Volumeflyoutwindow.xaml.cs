@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -22,6 +22,20 @@ namespace MyTaskbar
 
     public partial class VolumeFlyoutWindow : Window
     {
+        // [UI-SCALE]
+        double _uiScale = 1.0;
+        public double UIScale
+        {
+            get => _uiScale;
+            set
+            {
+                _uiScale = value;
+                if (Content is System.Windows.FrameworkElement root)
+                    root.LayoutTransform = Math.Abs(value - 1.0) < 0.01
+                        ? Transform.Identity
+                        : new ScaleTransform(value, value);
+            }
+        }
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT pt);
         [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
         [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
@@ -223,7 +237,7 @@ namespace MyTaskbar
                 string name = AudioHelper.GetDefaultDeviceName();
                 var label = GetDeviceLabel();
                 if (label != null)
-                    label.Text = string.IsNullOrEmpty(name) ? "Устройство вывода" : name;
+                    label.Text = string.IsNullOrEmpty(name) ? "Output device" : name;
 
                 var devices = AudioHelper.GetPlaybackDevices();
                 bool hasMultiple = devices.Count > 1;

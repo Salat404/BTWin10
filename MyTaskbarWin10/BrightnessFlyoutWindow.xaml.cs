@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -14,6 +14,20 @@ namespace MyTaskbar
 {
     public partial class BrightnessFlyoutWindow : Window
     {
+        // [UI-SCALE]
+        double _uiScale = 1.0;
+        public double UIScale
+        {
+            get => _uiScale;
+            set
+            {
+                _uiScale = value;
+                if (Content is System.Windows.FrameworkElement root)
+                    root.LayoutTransform = Math.Abs(value - 1.0) < 0.01
+                        ? Transform.Identity
+                        : new ScaleTransform(value, value);
+            }
+        }
         [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr hWnd, int nIndex);
         [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT pt);
@@ -128,13 +142,16 @@ namespace MyTaskbar
 
         // ── Показ ─────────────────────────────────────────────────────
 
-        public void ShowAt(double left, double top)
+        public void ShowAt(double left, double top, Func<double, double> repositionTop = null)
         {
             _monitors.Clear();
 
             if (_cachedMonitors != null && _cachedMonitors.Count > 0)
             {
                 BuildUI(_cachedMonitors);
+                Left = left;
+                UpdateLayout();
+                Top = repositionTop != null ? repositionTop(ActualHeight) : top;
                 Opacity = 1;
                 Show();
                 Activate();
@@ -144,10 +161,12 @@ namespace MyTaskbar
             }
 
             MonitorStack.Children.Clear();
+            Left = left;
+            Top = -9999;
             Opacity = 0;
             Show();
 
-            System.Threading.Tasks.Task.Run(() =>
+            _ = System.Threading.Tasks.Task.Run(() =>
             {
                 List<BrightnessHelper.MonitorInfo> list = null;
                 try { list = BrightnessHelper.GetMonitors(); }
@@ -159,6 +178,11 @@ namespace MyTaskbar
                     _cachedMonitors = list;
                     BuildUI(list);
                     UpdateLayout();
+                    // Пересчитываем Top по реальной высоте
+                    if (repositionTop != null)
+                        Top = repositionTop(ActualHeight);
+                    else
+                        Top = top;
                     Opacity = 1;
                     Activate();
                     InstallMouseHook();
@@ -168,7 +192,7 @@ namespace MyTaskbar
 
         void RefreshCacheInBackground()
         {
-            System.Threading.Tasks.Task.Run(() =>
+            _ = System.Threading.Tasks.Task.Run(() =>
             {
                 try { var l = BrightnessHelper.GetMonitors(); if (l != null) _cachedMonitors = l; }
                 catch { }
@@ -185,7 +209,7 @@ namespace MyTaskbar
             {
                 MonitorStack.Children.Add(new TextBlock
                 {
-                    Text = "Яркость не поддерживается",
+                    Text = "Brightness not supported",
                     Foreground = new SolidColorBrush(Color.FromRgb(180, 100, 100)),
                     FontSize = 11,
                     FontFamily = new FontFamily("Segoe UI"),
@@ -344,7 +368,7 @@ namespace MyTaskbar
                     {
                         dt.Stop();
                         if (!_pendingValues.TryGetValue(captIdx, out int v)) return;
-                        System.Threading.Tasks.Task.Run(() =>
+                        _ = System.Threading.Tasks.Task.Run(() =>
                         {
                             try
                             {

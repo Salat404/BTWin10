@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Management;
@@ -82,7 +82,7 @@ namespace MyTaskbar.Helpers
                         result.Add(new MonitorInfo
                         {
                             Index = idx++,
-                            Name = "Встроенный экран",
+                            Name = "Built-in display",
                             Brightness = cur,
                             IsBuiltIn = true,
                             HMonitor = IntPtr.Zero
@@ -114,7 +114,7 @@ namespace MyTaskbar.Helpers
                             {
                                 int pct = (int)Math.Round(cur * 100.0 / max);
                                 string name = string.IsNullOrWhiteSpace(pm.szPhysicalMonitorDescription)
-                                    ? $"Монитор {extIdx + 1}"
+                                    ? $"Monitor {extIdx + 1}"
                                     : pm.szPhysicalMonitorDescription;
                                 result.Add(new MonitorInfo
                                 {
@@ -165,7 +165,7 @@ namespace MyTaskbar.Helpers
         }
 
         public static Task<int> GetBrightnessAsync() =>
-            Task.Run(() => GetBuiltInBrightness());
+            _ = Task.Run(() => GetBuiltInBrightness());
 
         // ── Установка яркости ─────────────────────────────────────────────────────
 
@@ -236,10 +236,10 @@ namespace MyTaskbar.Helpers
         }
 
         public static Task<bool> SetBuiltInBrightnessAsync(int value) =>
-            Task.Run(() => SetBuiltInBrightness(value));
+            _ = Task.Run(() => SetBuiltInBrightness(value));
 
         public static Task<bool> SetBrightnessAsync(MonitorInfo monitor, int value) =>
-            Task.Run(() => SetBrightness(monitor, value));
+            _ = Task.Run(() => SetBrightness(monitor, value));
 
         // ── PowerShell fallback ───────────────────────────────────────────────────
 

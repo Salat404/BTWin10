@@ -41,6 +41,21 @@ namespace MyTaskbar
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern IntPtr GetModuleHandle(string lpModuleName);
 
+        // ── SetWindowPos для управления Z-order ──
+        static readonly IntPtr HWND_TOP = new IntPtr(0);
+        static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOACTIVATE = 0x0010;
+
+        // [GAME-10] Флаг: меню открывается поверх fullscreen-игры — нужен Topmost
+        public bool IsFullscreenMode { get; set; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter,
+            int x, int y, int cx, int cy, uint uFlags);
+
         delegate IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -135,23 +150,32 @@ namespace MyTaskbar
         // ══════════════════════════════════════════════════════════════
 
         static readonly string ProgramsFolder = Path.Combine(
-    AppDomain.CurrentDomain.BaseDirectory, "Programs");
-static readonly string GamesFolder = Path.Combine(
-    AppDomain.CurrentDomain.BaseDirectory, "Games");
+            AppDomain.CurrentDomain.BaseDirectory, "Programs");
+        static readonly string GamesFolder = Path.Combine(
+            AppDomain.CurrentDomain.BaseDirectory, "Games");
 
-        const double TileIconSize = 32;
-        const double TileHeight = 48;
-        const double TileMargin = 2;
+        // TileIconSize, TileHeight, TileMargin теперь — свойства выше (масштабируются с UIScale)
 
-        List<(string Name, string Path, BitmapSource Icon)> _tileItems = new List<(string, string, BitmapSource)>();
+        List<(string Name, string Path, BitmapSource Icon)> _tileItems =
+            new List<(string, string, BitmapSource)>();
+
+        FileSystemWatcher _watcherPrograms;
+        FileSystemWatcher _watcherGames;
 
         DateTime _hiddenAt = DateTime.MinValue;
         DateTime _lastClickInside = DateTime.MinValue;
 
         public const int HideGraceMs = 300;
         public bool JustHidden => (DateTime.UtcNow - _hiddenAt).TotalMilliseconds < HideGraceMs;
+        public void ResetHiddenAt() => _hiddenAt = DateTime.MinValue;
 
         public event Action<bool> MenuVisibilityChanged;
+        // [GAME-9] Событие: пользователь запустил приложение из меню (нужно снять блокер)
+        public event Action AppLaunched;
+        // [CLIP-FIX] Событие: меню достигло финальной позиции после анимации
+        public event Action MenuPositionReady;
+        // [BLUR-FIX] Стріляє після завершення анімації ховання (меню фізично за екраном)
+        public event Action MenuHideCompleted;
 
         public Window PreviewWindow { get; set; }
         public Window TaskbarWindow { get; set; }
@@ -169,16 +193,129 @@ static readonly string GamesFolder = Path.Combine(
         }
 
         // ══════════════════════════════════════════════════════════════
-        //  Анимация главного окна
+        //  Высота панели / позиции
         // ══════════════════════════════════════════════════════════════
+
+        // [UI-SCALE-MENU] Высота панели задач с учётом масштаба (40px × uiScale)
+        double ScaledTaskbarH => 40.0 * _uiScale;
+
+        double VisibleTop => IsBottom
+            ? SystemParameters.PrimaryScreenHeight - ScaledTaskbarH - (ActualHeight > 0 ? ActualHeight : 500) - 8
+            : ScaledTaskbarH + 8;
+
+        double HiddenTop => IsBottom
+            ? SystemParameters.PrimaryScreenHeight + 4
+            : -((ActualHeight > 0 ? ActualHeight : 500) + 4);
+
+        // Устанавливается из MainWindow перед ShowMenu()
+        public bool IsBottom { get; set; } = false;
+        // [UI-SCALE]
+        const double BaseTopBarH   = 36.0; // базовая высота верхней полоски
+        const double BaseTopBarBtn = 36.0; // базовая ширина/высота кнопок
+
+        const double BaseIconFontSize = 15.0;
+
+        // Находит первый TextBlock внутри визуального дерева элемента
+        static System.Windows.Controls.TextBlock FindIconTextBlock(DependencyObject parent)
+        {
+            for (int i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(parent); i++)
+            {
+                var child = System.Windows.Media.VisualTreeHelper.GetChild(parent, i);
+                if (child is System.Windows.Controls.TextBlock tb) return tb;
+                var found = FindIconTextBlock(child);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        void ScaleBtnIcon(Button btn, double fontSize)
+        {
+            if (btn == null || !btn.IsLoaded) return;
+            var tb = FindIconTextBlock(btn);
+            if (tb != null) tb.FontSize = fontSize;
+        }
+
+        void ApplyTopBarScale()
+        {
+            double s = _uiScale;
+            double h = Math.Round(BaseTopBarH * s);
+            double b = Math.Round(BaseTopBarBtn * s);
+            double fs = Math.Round(BaseIconFontSize * s, 1);
+
+            if (TopBarGrid != null)   TopBarGrid.Height = h;
+            if (ColPower != null)     ColPower.Width    = new GridLength(b);
+            if (ColSearch != null)    ColSearch.Width   = new GridLength(b);
+            if (ColSettings != null)  ColSettings.Width = new GridLength(b);
+
+            // Кнопки Restart и Sleep
+            if (BtnRestart != null) { BtnRestart.Width = b; BtnRestart.Height = h; }
+            if (BtnSleep   != null) { BtnSleep.Width   = b; BtnSleep.Height   = h; }
+
+            // Иконки — ищем TextBlock внутри визуального дерева каждой кнопки
+            ScaleBtnIcon(BtnPower,      fs);
+            ScaleBtnIcon(BtnRestart,    fs);
+            ScaleBtnIcon(BtnSleep,      fs);
+            ScaleBtnIcon(BtnToggleView, fs);
+            ScaleBtnIcon(BtnSettings,   fs);
+        }
+
+        const double BaseMenuWidth = 380.0; // базовая ширина меню при scale=1.0
+        const double BaseTileIconSize = 32;
+        const double BaseTileHeight   = 48;
+        const double BaseTileMargin   = 2;
+
+        // Актуальные размеры плиток с учётом текущего масштаба
+        double TileIconSize => BaseTileIconSize * _uiScale;
+        double TileHeight   => BaseTileHeight   * _uiScale;
+        double TileMargin   => BaseTileMargin;
+
+        double _uiScale = 1.0;
+        public double UIScale
+        {
+            get => _uiScale;
+            set
+            {
+                _uiScale = value;
+                // Масштабируем ширину окна пропорционально scale.
+                // LayoutTransform НЕ используем — он растягивает содержимое внутри
+                // фиксированной ширины и сжимает плитки.
+                // Вместо этого меняем Width окна, а SizeToContent="Height" сам
+                // пересчитает высоту под новую ширину.
+                this.Width = Math.Round(BaseMenuWidth * value);
+                ApplyTopBarScale();
+
+                // Пересобираем плитки чтобы TileIconSize/TileHeight пересчитались
+                if (IsLoaded && PanelPrograms != null)
+                    BuildAll();
+            }
+        }
+
+        // [UI-SCALE-MENU] Пересчёт позиции меню после изменения масштаба.
+        // Вызывается из MainWindow.ApplyUIScale() после установки UIScale.
+        // Если меню видно — немедленно двигаем его на новый VisibleTop.
+        // Если скрыто — просто обновляем HiddenTop чтобы следующий ShowMenu вышел правильно.
+        public void RepositionAfterScale()
+        {
+            try
+            {
+                UpdateLayout(); // пересчитать ActualHeight после нового ScaleTransform
+                PositionWindow();
+                if (_isShown && !_isAnimating)
+                    Top = VisibleTop;
+                else if (!_isShown)
+                    Top = HiddenTop;
+            }
+            catch { }
+        }
 
         public const double ANIM_SHOW_MS = 180;
         public const double ANIM_HIDE_MS = 130;
-        const double SLIDE_PX = 12;
+
         bool _isAnimating = false;
+        bool _initialized = false;
+        bool _isShown = false; // true когда меню видно или анимируется к видимому состоянию
 
         const int GWL_EXSTYLE_MW = -20;
-        const int WS_EX_TRANSPARENT_MW = 0x00000020;
         const int WS_EX_NOACTIVATE_MW = 0x08000000;
         [DllImport("user32.dll", EntryPoint = "GetWindowLong")] static extern int GetWindowLongMW(IntPtr hwnd, int index);
         [DllImport("user32.dll", EntryPoint = "SetWindowLong")] static extern int SetWindowLongMW(IntPtr hwnd, int index, int val);
@@ -188,18 +325,54 @@ static readonly string GamesFolder = Path.Combine(
             base.OnSourceInitialized(e);
             var hwnd = new WindowInteropHelper(this).Handle;
             int style = GetWindowLongMW(hwnd, GWL_EXSTYLE_MW);
-            style &= ~WS_EX_TRANSPARENT_MW;
             style &= ~WS_EX_NOACTIVATE_MW;
             SetWindowLongMW(hwnd, GWL_EXSTYLE_MW, style);
         }
+
+        // ══════════════════════════════════════════════════════════════
+        //  Z-order: под панелью задач
+        // ══════════════════════════════════════════════════════════════
+
+        void PutBelowTaskbar()
+        {
+            var hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd == IntPtr.Zero) return;
+            if (IsFullscreenMode && TaskbarWindow != null)
+            {
+                // [GAME-10] В fullscreen-режиме вставляем меню сразу ПОД панелью задач в z-order.
+                // SetWindowPos с hWndInsertAfter=taskbarHwnd означает "поместить сразу за ней (ниже)".
+                // Это гарантирует: панель > меню > игра, без риска что меню окажется выше панели.
+                try
+                {
+                    IntPtr taskbarHwnd = new WindowInteropHelper(TaskbarWindow).Handle;
+                    if (taskbarHwnd != IntPtr.Zero)
+                    {
+                        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+                        SetWindowPos(hwnd, taskbarHwnd, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+                        return;
+                    }
+                }
+                catch { }
+                // Fallback: просто Topmost если нет handle панели
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+            }
+            else
+            {
+                // Обычный режим — снимаем Topmost, поднимаем среди обычных окон
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+                SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        //  Конструктор
+        // ══════════════════════════════════════════════════════════════
 
         public MenuWindow()
         {
             InitializeComponent();
 
-            Topmost = true;
-            RenderTransform = new TranslateTransform(0, 0);
-            RenderTransformOrigin = new Point(0.5, 0);
+            // Topmost намеренно НЕ ставим — панель задач сама держит себя выше
 
             PreviewMouseDown += (s, e) =>
             {
@@ -227,16 +400,30 @@ static readonly string GamesFolder = Path.Combine(
             Deactivated += (s, e) =>
             {
                 if ((DateTime.UtcNow - _lastClickInside).TotalMilliseconds < 200) return;
+                if (!_isShown) return; // [FIX-FLICKER] уже скрыто или скрывается — игнорируем
                 HideAnimated();
             };
 
             Loaded += (s, e) =>
             {
                 ApplyAcrylic();
+                ApplyTopBarScale();
                 BuildAll();
                 PositionWindow();
+                Top = HiddenTop;
+                Opacity = 1;
                 if (Background == null || Background == Brushes.Transparent)
                     Background = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0));
+
+                // Следим за папками Programs и Games — автообновление при добавлении/удалении ярлыков
+                _watcherPrograms = StartFolderWatcher(ProgramsFolder);
+                _watcherGames = StartFolderWatcher(GamesFolder);
+            };
+
+            Closed += (s, e) =>
+            {
+                try { _watcherPrograms?.Dispose(); } catch { }
+                try { _watcherGames?.Dispose(); } catch { }
             };
         }
 
@@ -260,12 +447,16 @@ static readonly string GamesFolder = Path.Combine(
         void PositionWindow()
         {
             UpdateLayout();
-            var src = PresentationSource.FromVisual(this);
-            double dpi = src?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
-            double sw = SystemParameters.PrimaryScreenWidth / dpi;
-            Left = Math.Round((sw - ActualWidth) / 2);
-            Top = 40 + 8;
+            // [UI-SCALE-POS] Центрирование меню по экрану с учётом DPI.
+            // SystemParameters.PrimaryScreenWidth уже в WPF DIP (device-independent units),
+            // ActualWidth тоже в DIP — делим в DIP-пространстве, деление на dpi не нужно.
+            double sw = SystemParameters.PrimaryScreenWidth;
+            Left = Math.Round((sw - ActualWidth) / 2.0);
         }
+
+        // ══════════════════════════════════════════════════════════════
+        //  ShowMenu — слайд сверху вниз
+        // ══════════════════════════════════════════════════════════════
 
         public void ShowMenu()
         {
@@ -273,106 +464,146 @@ static readonly string GamesFolder = Path.Combine(
 
             PositionWindow();
 
-            var tt = GetTranslate();
-            tt.Y = -SLIDE_PX;
-            Opacity = 0;
+            if (!_initialized)
+            {
+                Top = HiddenTop;
+                Opacity = 1;
+                Show();
+                _initialized = true;
+            }
 
-            Topmost = true;
-            Show();
-            Topmost = true;
-            Activate();
+            // Вместо Topmost = true — ставим под панель задач
+            PutBelowTaskbar();
 
             InstallMouseHook();
+            _isShown = true;
             MenuVisibilityChanged?.Invoke(true);
 
             _isAnimating = true;
+            // Если анимация скрытия была прервана — начинаем с текущей позиции,
+            // а не прыгаем на HiddenTop (иначе дёрганье)
+            double minTop = Math.Min(HiddenTop, VisibleTop);
+            double maxTop = Math.Max(HiddenTop, VisibleTop);
+            double fromTop = (Top >= minTop && Top <= maxTop) ? Top : HiddenTop;
+            double toTop = VisibleTop;
+
+            BeginAnimation(TopProperty, null);
+            Top = fromTop;
+
             var ease = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 4 };
-            var dur = TimeSpan.FromMilliseconds(ANIM_SHOW_MS);
+            var aSlide = new DoubleAnimation(fromTop, toTop, TimeSpan.FromMilliseconds(ANIM_SHOW_MS))
+            {
+                EasingFunction = ease,
+                FillBehavior = FillBehavior.Stop
+            };
+            aSlide.Completed += (s, e) =>
+            {
+                _isAnimating = false;
+                BeginAnimation(TopProperty, null);
+                Top = toTop;
+                PutBelowTaskbar();   // повторяем после анимации — на случай перекрытия
+                Activate();
+                // [CLIP-FIX] Меню достигло финальной позиции — обновляем ClipCursor
+                // чтобы курсор мог свободно перемещаться в область меню
+                MenuPositionReady?.Invoke();
+            };
 
-            var aOpacity = new DoubleAnimation(0, 1, dur) { EasingFunction = ease };
-            var aSlide = new DoubleAnimation(-SLIDE_PX, 0, dur) { EasingFunction = ease };
-            aSlide.Completed += (s, e) => { _isAnimating = false; tt.Y = 0; };
-
-            BeginAnimation(OpacityProperty, aOpacity);
-            tt.BeginAnimation(TranslateTransform.YProperty, aSlide);
+            BeginAnimation(TopProperty, aSlide);
         }
+
+        // ══════════════════════════════════════════════════════════════
+        //  HideAnimated — слайд снизу вверх за край
+        // ══════════════════════════════════════════════════════════════
 
         public void HideAnimated()
         {
-            if (!IsVisible) return;
+            if (!_initialized) return;
+            // [FIX-FLICKER] Если уже скрываемся (анимация скрытия запущена) — не перезапускаем.
+            // Повторный вызов из Deactivated прерывал бы анимацию и вызывал мерцание/дёрганье
+            // при последующих нажатиях Win-клавиши.
+            if (_isAnimating && !_isShown) return;
 
             if (_powerExpanded)
                 CollapsePowerImmediate();
 
-            _hiddenAt = DateTime.UtcNow;
+            // [GAME-11-FIX] Перед анимацией скрытия принудительно ставим меню
+            // ПОД панелью задач — иначе при первом скрытии меню уезжает поверх тулбара.
+            // (z-order мог сбиться после ShowFullscreenBlocker, который делает тулбар Topmost)
+            PutBelowTaskbar();
+
+            // _hiddenAt обновляем только если меню действительно было видно —
+            // иначе повторный вызов (напр. из Deactivated после Win-key) сдвигает
+            // таймер вперёд и StartButton_Click пропускает следующий клик мышью.
+            if (IsVisible) _hiddenAt = DateTime.UtcNow;
             UninstallMouseHook();
+
+            // Логически закрываем сразу — чтобы StartButton_Click не вызвал
+            // HideAnimated повторно пока анимация скрытия ещё идёт (дёрганье)
+            _isShown = false;
+            MenuVisibilityChanged?.Invoke(false);
 
             if (_isAnimating) StopAllAnimations();
 
             _isAnimating = true;
+            double fromTop = Top;
+            double toTop = HiddenTop;
+
             var ease = new ExponentialEase { EasingMode = EasingMode.EaseIn, Exponent = 4 };
-            var dur = TimeSpan.FromMilliseconds(ANIM_HIDE_MS);
-
-            double fromOpacity = Opacity;
-            double fromY = GetTranslate().Y;
-
-            var aOpacity = new DoubleAnimation(fromOpacity, 0, dur) { EasingFunction = ease };
-            var aSlide = new DoubleAnimation(fromY, -SLIDE_PX, dur) { EasingFunction = ease };
-            aOpacity.Completed += (s, e) =>
+            var aSlide = new DoubleAnimation(fromTop, toTop, TimeSpan.FromMilliseconds(ANIM_HIDE_MS))
+            {
+                EasingFunction = ease,
+                FillBehavior = FillBehavior.Stop
+            };
+            aSlide.Completed += (s, e) =>
             {
                 _isAnimating = false;
-                BeginAnimation(OpacityProperty, null);
-                GetTranslate().BeginAnimation(TranslateTransform.YProperty, null);
-                GetTranslate().Y = -SLIDE_PX;
-                Opacity = 0;
-                Hide();
-                MenuVisibilityChanged?.Invoke(false);
+                BeginAnimation(TopProperty, null);
+                Top = toTop;
+                // [GAME-10] Сбрасываем fullscreen-режим и снимаем Topmost при закрытии
+                IsFullscreenMode = false;
+                var hwnd = new WindowInteropHelper(this).Handle;
+                if (hwnd != IntPtr.Zero)
+                    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+                // [BLUR-FIX] Меню фізично за екраном — сигналізуємо для скидання blur
+                MenuHideCompleted?.Invoke();
             };
 
-            BeginAnimation(OpacityProperty, aOpacity);
-            GetTranslate().BeginAnimation(TranslateTransform.YProperty, aSlide);
+            BeginAnimation(TopProperty, aSlide);
         }
+
+        // ══════════════════════════════════════════════════════════════
+        //  IsVisible / StopAllAnimations
+        // ══════════════════════════════════════════════════════════════
+
+        public new bool IsVisible => _isShown;
 
         void StopAllAnimations()
         {
+            BeginAnimation(TopProperty, null);
             BeginAnimation(OpacityProperty, null);
-            GetTranslate().BeginAnimation(TranslateTransform.YProperty, null);
             _isAnimating = false;
-        }
-
-        TranslateTransform GetTranslate()
-        {
-            if (RenderTransform is TranslateTransform tt) return tt;
-            var t = new TranslateTransform(0, 0);
-            RenderTransform = t;
-            RenderTransformOrigin = new Point(0.5, 0);
-            return t;
         }
 
         public void Refresh() => BuildAll();
 
         // ══════════════════════════════════════════════════════════════
-        //  Питание — Restart и Sleep выезжают вправо прямо в тулбаре
+        //  Питание
         // ══════════════════════════════════════════════════════════════
 
-        // true = кнопки Restart и Sleep сейчас открыты
         bool _powerExpanded = false;
-
-        // Итоговая ширина панели: 2 кнопки по 36px = 72
-        const double PowerExpandedWidth = 72.0;
+        const double BasePowerExpandedWidth = 72.0;
+        double PowerExpandedWidth => Math.Round(BasePowerExpandedWidth * _uiScale);
 
         void Power_Click(object sender, RoutedEventArgs e)
         {
             if (_powerExpanded)
             {
-                // Второй клик — shutdown
                 CollapsePowerImmediate();
                 HideAnimated();
                 DoShutdown();
             }
             else
             {
-                // Первый клик — раскрыть Restart и Sleep
                 ExpandPowerButtons();
             }
         }
@@ -382,7 +613,6 @@ static readonly string GamesFolder = Path.Combine(
             PowerExpandPanel.BeginAnimation(FrameworkElement.WidthProperty, null);
             PowerExpandPanel.BeginAnimation(UIElement.OpacityProperty, null);
 
-            // Сброс трансформ на кнопках
             BtnRestart.RenderTransform = new TranslateTransform(-PowerExpandedWidth, 0);
             BtnSleep.RenderTransform = new TranslateTransform(-PowerExpandedWidth, 0);
 
@@ -394,15 +624,12 @@ static readonly string GamesFolder = Path.Combine(
             var ease = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 4 };
             var dur = TimeSpan.FromMilliseconds(220);
 
-            // Кнопки выезжают слева направо
             var animX1 = new DoubleAnimation(-PowerExpandedWidth, 0, dur) { EasingFunction = ease };
             var animX2 = new DoubleAnimation(-PowerExpandedWidth, 0, dur)
             {
                 EasingFunction = ease,
-                BeginTime = TimeSpan.FromMilliseconds(30) // небольшой стаггер
+                BeginTime = TimeSpan.FromMilliseconds(30)
             };
-
-            // Прозрачность панели
             var animO = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(180))
             {
                 EasingFunction = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 3 }
@@ -422,13 +649,11 @@ static readonly string GamesFolder = Path.Combine(
 
             var animX1 = new DoubleAnimation(0, -PowerExpandedWidth, dur) { EasingFunction = ease };
             var animX2 = new DoubleAnimation(0, -PowerExpandedWidth, dur) { EasingFunction = ease };
-
             var animO = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(130))
             {
                 EasingFunction = new ExponentialEase { EasingMode = EasingMode.EaseIn, Exponent = 3 }
             };
 
-            // По завершении — схлопываем ширину
             animO.Completed += (s, e) =>
             {
                 PowerExpandPanel.BeginAnimation(FrameworkElement.WidthProperty, null);
@@ -463,7 +688,7 @@ static readonly string GamesFolder = Path.Combine(
         void Sleep_Click(object sender, RoutedEventArgs e)
         {
             CollapsePowerImmediate();
-            Hide();
+            HideAnimated();
             DoSleep();
         }
 
@@ -473,8 +698,8 @@ static readonly string GamesFolder = Path.Combine(
 
         void Search_Click(object sender, RoutedEventArgs e)
         {
-            Hide();
-            System.Threading.Tasks.Task.Delay(150).ContinueWith(_ =>
+            HideAnimated();
+            _ = System.Threading.Tasks.Task.Delay(150).ContinueWith(_ =>
             {
                 Dispatcher.Invoke(() =>
                 {
@@ -493,6 +718,81 @@ static readonly string GamesFolder = Path.Combine(
         // ══════════════════════════════════════════════════════════════
         //  Плитки
         // ══════════════════════════════════════════════════════════════
+
+        // ══════════════════════════════════════════════════════════════
+        //  Авто-обновление папок Programs / Games
+        // ══════════════════════════════════════════════════════════════
+
+        // ══════════════════════════════════════════════════════════════
+        //  Порядок ярлыков: суффикс .N в имени файла (Discord.1, Chrome.2 …)
+        // ══════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Возвращает число из суффикса ".N" в конце имени файла, или -1 если суффикса нет.
+        /// Примеры: "Discord.1" → 1, "Chrome.12" → 12, "Telegram" → -1
+        /// </summary>
+        static int ParseOrderSuffix(string nameWithoutExt)
+        {
+            if (string.IsNullOrEmpty(nameWithoutExt)) return -1;
+            int dot = nameWithoutExt.LastIndexOf('.');
+            if (dot < 0 || dot == nameWithoutExt.Length - 1) return -1;
+            string suffix = nameWithoutExt.Substring(dot + 1);
+            return int.TryParse(suffix, out int n) && n >= 0 ? n : -1;
+        }
+
+        /// <summary>
+        /// Убирает суффикс ".N" из имени для отображения.
+        /// "Discord.1" → "Discord", "Telegram" → "Telegram"
+        /// </summary>
+        static string StripOrderSuffix(string nameWithoutExt)
+        {
+            if (string.IsNullOrEmpty(nameWithoutExt)) return nameWithoutExt;
+            int dot = nameWithoutExt.LastIndexOf('.');
+            if (dot < 0) return nameWithoutExt;
+            string suffix = nameWithoutExt.Substring(dot + 1);
+            return int.TryParse(suffix, out _) ? nameWithoutExt.Substring(0, dot) : nameWithoutExt;
+        }
+
+        FileSystemWatcher StartFolderWatcher(string folder)
+        {
+            try
+            {
+                if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
+                var w = new FileSystemWatcher(folder)
+                {
+                    Filter = "*.*",
+                    NotifyFilter = NotifyFilters.FileName,
+                    IncludeSubdirectories = false,
+                    EnableRaisingEvents = true
+                };
+                // Дебаунс: перестраиваем меню не чаще раза в 500 мс,
+                // чтобы не дёргать UI при копировании нескольких файлов сразу
+                System.Threading.Timer debounce = null;
+                FileSystemEventHandler handler = (s, e) =>
+                {
+                    debounce?.Dispose();
+                    debounce = new System.Threading.Timer(_ =>
+                        Dispatcher.BeginInvoke(new Action(BuildAll)),
+                        null, 500, System.Threading.Timeout.Infinite);
+                };
+                RenamedEventHandler renamedHandler = (s, e) =>
+                {
+                    debounce?.Dispose();
+                    debounce = new System.Threading.Timer(_ =>
+                        Dispatcher.BeginInvoke(new Action(BuildAll)),
+                        null, 500, System.Threading.Timeout.Infinite);
+                };
+                w.Created += handler;
+                w.Deleted += handler;
+                w.Renamed += renamedHandler;
+                return w;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[MenuWindow] StartFolderWatcher({folder}): {ex.Message}");
+                return null;
+            }
+        }
 
         void BuildAll()
         {
@@ -513,12 +813,24 @@ static readonly string GamesFolder = Path.Combine(
                     .Concat(Directory.GetFiles(folder, "*.url")).ToArray();
             }
             catch { return; }
-            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+
+            // Сортируем: сначала файлы с суффиксом .N (по номеру), потом остальные по алфавиту
+            Array.Sort(files, (a, b) =>
+            {
+                int na = ParseOrderSuffix(Path.GetFileNameWithoutExtension(a));
+                int nb = ParseOrderSuffix(Path.GetFileNameWithoutExtension(b));
+                if (na >= 0 && nb >= 0) return na.CompareTo(nb);
+                if (na >= 0) return -1;   // у a есть номер — он идёт раньше
+                if (nb >= 0) return 1;   // у b есть номер — он идёт раньше
+                return StringComparer.OrdinalIgnoreCase.Compare(a, b);
+            });
+
             foreach (string file in files)
             {
                 try
                 {
-                    string name = Path.GetFileNameWithoutExtension(file);
+                    string rawName = Path.GetFileNameWithoutExtension(file);
+                    string name = StripOrderSuffix(rawName);  // убираем .1 .2 .3 из отображаемого имени
                     string resolved = Helpers.IconHelper.ResolveShortcut(file);
                     BitmapSource ico = null;
                     if (!string.IsNullOrEmpty(resolved) && File.Exists(resolved))
@@ -592,22 +904,25 @@ static readonly string GamesFolder = Path.Combine(
 
             var hov = new Trigger { Property = Button.IsMouseOverProperty, Value = true };
             hov.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush(Color.FromArgb(0x44, 0xFF, 0xFF, 0xFF)), "bd"));
-            hov.Setters.Add(new Setter(Border.BorderBrushProperty, new SolidColorBrush(Color.FromArgb(0x88, 0x4A, 0x9E, 0xFF)), "bd"));
+            hov.Setters.Add(new Setter(Border.BorderBrushProperty, new SolidColorBrush(Color.FromArgb(0xCC, 0xE0, 0xE0, 0xE0)), "bd"));
+            hov.Setters.Add(new Setter(Border.BorderThicknessProperty, new Thickness(1.5), "bd"));
             tpl.Triggers.Add(hov);
             var prs = new Trigger { Property = Button.IsPressedProperty, Value = true };
-            prs.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush(Color.FromArgb(0x55, 0x4A, 0x9E, 0xFF)), "bd"));
+            prs.Setters.Add(new Setter(Border.BackgroundProperty, new SolidColorBrush(Color.FromArgb(0x55, 0xFF, 0xFF, 0xFF)), "bd"));
+            prs.Setters.Add(new Setter(Border.BorderBrushProperty, new SolidColorBrush(Color.FromArgb(0xFF, 0xE0, 0xE0, 0xE0)), "bd"));
+            prs.Setters.Add(new Setter(Border.BorderThicknessProperty, new Thickness(1.5), "bd"));
             tpl.Triggers.Add(prs);
             btn.Template = tpl;
 
             btn.Click += (s, ev) =>
             {
-                try { Process.Start(new ProcessStartInfo(filePath) { UseShellExecute = true }); }
+                try { AppLaunched?.Invoke(); Process.Start(new ProcessStartInfo(filePath) { UseShellExecute = true }); }
                 catch (Exception ex)
                 {
                     MessageBox.Show("Launch error:\n" + filePath + "\n\n" + ex.Message,
                         "Error", MessageBoxButton.OK, MessageBoxImage.Warning);
                 }
-                Hide();
+                HideAnimated();
             };
             return btn;
         }
@@ -735,7 +1050,7 @@ static readonly string GamesFolder = Path.Combine(
         void Settings_Click(object sender, RoutedEventArgs e)
         {
             try { Process.Start("ms-settings:"); } catch { }
-            Hide();
+            HideAnimated();
         }
 
         void DoSleep()

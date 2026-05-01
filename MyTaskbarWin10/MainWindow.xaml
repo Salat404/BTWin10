@@ -10,6 +10,7 @@
         ShowInTaskbar="False"
         ResizeMode="NoResize"
         SizeToContent="Width"
+        UseLayoutRounding="True"
         SizeChanged="Window_SizeChanged">
 
     <Window.Resources>
@@ -69,7 +70,8 @@
             <Setter Property="Background" Value="#1E1E1E"/>
             <Setter Property="BorderBrush" Value="#3A3A3A"/>
             <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="4"/>
+            <Setter Property="Padding" Value="2"/>
+            <Setter Property="MinWidth" Value="180"/>
             <Setter Property="Effect" Value="{StaticResource MenuShadow}"/>
             <Setter Property="Template">
                 <Setter.Value>
@@ -77,7 +79,8 @@
                         <Border Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                Padding="{TemplateBinding Padding}">
+                                Padding="{TemplateBinding Padding}"
+                                CornerRadius="0">
                             <StackPanel IsItemsHost="True"/>
                         </Border>
                     </ControlTemplate>
@@ -88,20 +91,24 @@
         <Style x:Key="DarkMenuItem" TargetType="MenuItem">
             <Setter Property="Foreground" Value="#E0E0E0"/>
             <Setter Property="Background" Value="Transparent"/>
-            <Setter Property="Padding" Value="12,6"/>
-            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Padding" Value="0,4,12,4"/>
+            <Setter Property="FontSize" Value="12"/>
             <Setter Property="FontFamily" Value="Segoe UI"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="MenuItem">
-                        <Border x:Name="border" Background="{TemplateBinding Background}" Margin="2,1">
+                        <Border x:Name="border" Background="{TemplateBinding Background}" Margin="1,1"
+                                CornerRadius="0">
                             <ContentPresenter ContentSource="Header"
                                               Margin="{TemplateBinding Padding}"
-                                              VerticalAlignment="Center"/>
+                                              VerticalAlignment="Center"
+                                              HorizontalAlignment="Left"
+                                              RecognizesAccessKey="False"/>
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsHighlighted" Value="True">
-                                <Setter TargetName="border" Property="Background" Value="#2E2E2E"/>
+                                <Setter TargetName="border" Property="Background" Value="#333333"/>
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Foreground" Value="#666"/>
@@ -115,7 +122,7 @@
         <Style x:Key="DarkMenuSeparator" TargetType="Separator">
             <Setter Property="Background" Value="#3A3A3A"/>
             <Setter Property="Height" Value="1"/>
-            <Setter Property="Margin" Value="8,4"/>
+            <Setter Property="Margin" Value="10,3"/>
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Separator">
@@ -130,12 +137,16 @@
     </Window.Resources>
 
     <!-- Фон убран из XAML — Acrylic/Blur применяется через WinAPI в AcrylicHelper.cs -->
-    <Border Background="Transparent" x:Name="RootBorder">
+    <!-- BorderThickness обновляется из кода: Bottom-режим = 0,1,1,0; Top-режим = 0,0,1,1 -->
+    <Border Background="Transparent" x:Name="RootBorder"
+            SnapsToDevicePixels="True">
+        <Grid>
         <StackPanel Orientation="Horizontal" Height="40" x:Name="MainPanel">
 
             <!-- Кнопка Старт -->
             <Button x:Name="StartButton" Style="{StaticResource IconButton}"
-                    Click="StartButton_Click" ToolTip="Пуск">
+                    Click="StartButton_Click" ToolTip="Start"
+                    MouseRightButtonUp="StartButton_RightClick">
                 <UniformGrid Width="18" Height="18"
                              Rows="2" Columns="2"
                              IsHitTestVisible="False">
@@ -158,7 +169,7 @@
             <Button x:Name="TrayButton" Style="{StaticResource MedIconButton}"
                     Width="26"
                     Tag="closed"
-                    ToolTip="Скрытые значки"
+                    ToolTip="Hidden icons"
                     Click="TrayButton_Click">
                 <Grid IsHitTestVisible="False">
                     <TextBlock x:Name="TrayIconClosed"
@@ -183,7 +194,7 @@
             <!-- Яркость -->
             <Button x:Name="BrightnessButton" Style="{StaticResource MedIconButton}"
                     Width="28"
-                    ToolTip="Яркость"
+                    ToolTip="Brightness"
                     Click="BrightnessButton_Click">
                 <TextBlock x:Name="BrightnessIcon"
                            Text="&#xE706;"
@@ -198,8 +209,9 @@
             <!-- Громкость -->
             <Button x:Name="VolumeButton" Style="{StaticResource MedIconButton}"
                     Width="28"
-                    ToolTip="Громкость"
-                    Click="VolumeButton_Click">
+                    ToolTip="Volume"
+                    Click="VolumeButton_Click"
+                    MouseRightButtonUp="VolumeButton_RightClick">
                 <TextBlock x:Name="VolumeIcon"
                            Text="&#xE767;"
                            FontFamily="Segoe MDL2 Assets"
@@ -212,7 +224,7 @@
 
             <!-- Батарея -->
             <Button x:Name="BatteryButton" Style="{StaticResource MedIconButton}"
-                    ToolTip="Батарея"
+                    ToolTip="Battery"
                     Visibility="Collapsed"
                     Width="38">
                 <StackPanel Orientation="Horizontal"
@@ -250,7 +262,7 @@
             <!-- Язык ввода -->
             <Button x:Name="LangButton" Style="{StaticResource MedIconButton}"
                     Width="28"
-                    ToolTip="Сменить раскладку (Alt+Shift)"
+                    ToolTip="Switch layout (Shift+Alt+O)"
                     Click="LangButton_Click">
                 <TextBlock x:Name="LangLabel" Text="RU"
                            FontSize="14"
@@ -285,7 +297,7 @@
             <!-- WiFi -->
             <Button x:Name="WifiButton" Style="{StaticResource MedIconButton}"
                     Width="28"
-                    ToolTip="Сети WiFi"
+                    ToolTip="Wi-Fi networks"
                     Click="WifiButton_Click">
                 <TextBlock x:Name="WifiIcon"
                            Text="&#xE701;"
@@ -305,7 +317,7 @@
 
             <!-- Часы и дата -->
             <Border Height="40" Background="#01000000"
-                    Cursor="Hand" ToolTip="Дата и время"
+                    Cursor="Hand" ToolTip="Date and time"
                     Padding="8,0"
                     Margin="0,0,4,0">
                 <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center"
@@ -320,5 +332,23 @@
             </Border>
 
         </StackPanel>
+
+            <!-- Линии обводки поверх всего содержимого (в т.ч. поверх RunBar-индикаторов) -->
+            <!-- Top-режим: снизу + справа. Bottom-режим: сверху + справа -->
+            <!-- Верхняя линия (видна в Bottom-режиме) -->
+            <Rectangle x:Name="BorderLineTop"
+                       Height="1" VerticalAlignment="Top" HorizontalAlignment="Stretch"
+                       Fill="#22FFFFFF" IsHitTestVisible="False"
+                       Visibility="Visible"/>
+            <!-- Нижняя линия (видна в Top-режиме) -->
+            <Rectangle x:Name="BorderLineBottom"
+                       Height="1" VerticalAlignment="Bottom" HorizontalAlignment="Stretch"
+                       Fill="#22FFFFFF" IsHitTestVisible="False"
+                       Visibility="Collapsed"/>
+            <!-- Правая линия (всегда) -->
+            <Rectangle x:Name="BorderLineRight"
+                       Width="1" HorizontalAlignment="Right" VerticalAlignment="Stretch"
+                       Fill="#22FFFFFF" IsHitTestVisible="False"/>
+        </Grid>
     </Border>
 </Window>

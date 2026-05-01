@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -38,7 +38,7 @@ namespace MyTaskbar
 
         public void BuildIndexAsync()
         {
-            System.Threading.Tasks.Task.Run(() =>
+            _ = System.Threading.Tasks.Task.Run(() =>
             {
                 try
                 {
@@ -575,7 +575,7 @@ namespace MyTaskbar
             "nvidia container",
             "nvidia telemetry",
             "nvidia watchdog",
-            "nvidia графический драйвер",
+            "nvidia graphics driver",
             "nvcpl",
             // Кортана
             "cortana",

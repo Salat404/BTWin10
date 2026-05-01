@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -11,11 +11,29 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
+using Windows.Devices.Radios;
 
 namespace MyTaskbar
 {
     public partial class WifiWindow : Window
     {
+        // Устанавливается из MainWindow перед ShowAt()
+        public bool IsBottom { get; set; } = false;
+        // [UI-SCALE]
+        double _uiScale = 1.0;
+        public double UIScale
+        {
+            get => _uiScale;
+            set
+            {
+                _uiScale = value;
+                if (Content is System.Windows.FrameworkElement root)
+                    root.LayoutTransform = Math.Abs(value - 1.0) < 0.01
+                        ? Transform.Identity
+                        : new ScaleTransform(value, value);
+            }
+        }
+
         // ════════════════════════════════════════════════════════════════
         //  WlanAPI P/Invoke
         // ════════════════════════════════════════════════════════════════
@@ -154,7 +172,7 @@ namespace MyTaskbar
                         new IntPtr(ifList.ToInt64() + Marshal.SizeOf<WLAN_INTERFACE_INFO_LIST>()));
                     _iface = info.Guid;
                     _cachedAdapterName = info.Desc?.Trim();
-                    Debug.WriteLine($"[WifiWindow] Адаптер: '{_cachedAdapterName}', GUID={_iface}");
+                    Debug.WriteLine($"[WifiWindow] Adapter: '{_cachedAdapterName}', GUID={_iface}");
                 }
                 finally { WlanFreeMemory(ifList); }
             }
@@ -197,7 +215,7 @@ namespace MyTaskbar
             if (onlyIfVisible && !IsVisible) return;
             _bgScanning = true;
 
-            Task.Run(() =>
+            _ = Task.Run(() =>
             {
                 try
                 {
@@ -241,7 +259,7 @@ namespace MyTaskbar
                 }
                 else
                 {
-                    Status("Сканирование…", "#888888");
+                    Status("Scanning…", "#888888");
                 }
             }
             else
@@ -258,8 +276,31 @@ namespace MyTaskbar
             double screenW = SystemParameters.PrimaryScreenWidth;
             double winW = ActualWidth > 0 ? ActualWidth : Width;
             Left = screenW - winW;
-            Top = 0;
-            Activate();
+
+            if (IsBottom)
+            {
+                // Панель внизу — прижимаем меню вплотную над ней
+                Top = screenH; // временно за экраном
+                RootBorder.BorderThickness = new Thickness(0, 1, 0, 0); // сверху
+                Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(() =>
+                {
+                    InvalidateMeasure();
+                    InvalidateArrange();
+                    UpdateLayout();
+                    double h = ActualHeight > 0 ? ActualHeight : Height;
+                    // WorkArea.Bottom = верхний край нашей панели (панель зарезервировала низ)
+                    double panelTop = SystemParameters.WorkArea.Bottom;
+                    Top = panelTop - h;
+                    Activate();
+                }));
+            }
+            else
+            {
+                // Панель вверху — оригинальное поведение
+                RootBorder.BorderThickness = new Thickness(0, 0, 0, 1); // снизу
+                Top = 0;
+                Activate();
+            }
 
             _refresh?.Stop();
             _refresh = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
@@ -293,7 +334,20 @@ namespace MyTaskbar
                 var i = Marshal.PtrToStructure<WLAN_INTERFACE_INFO>(
                     new IntPtr(l.ToInt64() + Marshal.SizeOf<WLAN_INTERFACE_INFO_LIST>()));
                 Debug.WriteLine($"[WifiWindow] AdapterOn: State={i.State}");
-                return i.State != 0;
+
+                // Состояния WLAN_INTERFACE_STATE:
+                //  0 = not_ready      — адаптер не готов / выключен
+                //  1 = connected      — подключён        ← включён
+                //  2 = ad_hoc         — ad-hoc           ← включён
+                //  3 = disconnecting  — отключается      ← включён
+                //  4 = disconnected   — радио выключено WinRT/airplane mode ← ВЫКЛЮЧЕН
+                //  5 = associating    — подключается     ← включён
+                //  6 = discovering    — сканирует        ← включён
+                //  7 = authenticating — аутентификация   ← включён
+                //
+                // State=4 после WinRT SetState(Off) — это "радио выключено",
+                // возвращаем false чтобы тайл стал серым.
+                return i.State != 0 && i.State != 4;
             }
             catch { return false; }
             finally { if (l != IntPtr.Zero) WlanFreeMemory(l); }
@@ -320,7 +374,7 @@ namespace MyTaskbar
                 int sz = Marshal.SizeOf<WLAN_AVAILABLE_NETWORK>();
                 string conSsid = ConnectedSsid();
 
-                Debug.WriteLine($"[WifiWindow] LoadNets: всего записей = {cnt}, ConnectedSsid='{conSsid}'");
+                Debug.WriteLine($"[WifiWindow] LoadNets: total entries = {cnt}, ConnectedSsid='{conSsid}'");
 
                 for (int i = 0; i < cnt; i++)
                 {
@@ -332,7 +386,7 @@ namespace MyTaskbar
                         int rawLen = n.Ssid.Len > 0 ? Math.Min((int)n.Ssid.Len, 32) : 0;
                         string rawHex = rawLen > 0
                             ? BitConverter.ToString(n.Ssid.SSID, 0, rawLen)
-                            : "(пусто)";
+                            : "(empty)";
                         Debug.WriteLine($"[WifiWindow] [{i}] RAW SSID: len={n.Ssid.Len} hex={rawHex} | Profile='{n.ProfileName}' Signal={n.Signal}");
 
                         string ssid = "";
@@ -387,7 +441,7 @@ namespace MyTaskbar
                 return b.Signal.CompareTo(a.Signal);
             });
 
-            Debug.WriteLine($"[WifiWindow] LoadNets итог: {result.Count} сетей");
+            Debug.WriteLine($"[WifiWindow] LoadNets result: {result.Count} networks");
             foreach (var net in result)
                 Debug.WriteLine($"  {net.Signal,3}% {(net.Connected ? "[*]" : "   ")} {net.SSID}");
 
@@ -448,13 +502,13 @@ namespace MyTaskbar
                 {
                     string t = line.Trim();
                     if (t.IndexOf("onnect", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        t.IndexOf("одключения", StringComparison.Ordinal) >= 0 ||
-                        t.IndexOf("ежим", StringComparison.OrdinalIgnoreCase) >= 0)
+                        t.IndexOf("одключения", StringComparison.Ordinal) >= 0 || // "одключения" = suffix of Russian "connection"
+                        t.IndexOf("ежим", StringComparison.OrdinalIgnoreCase) >= 0) // "ежим" = suffix of Russian "mode"
                     {
                         int colon = t.IndexOf(':');
                         if (colon < 0) continue;
                         string val = t.Substring(colon + 1).Trim().ToLowerInvariant();
-                        return val.Contains("auto") || val.Contains("автомат");
+                        return val.Contains("auto") || val.Contains("автомат"); // "автомат" = Russian "automatic"
                     }
                 }
             }
@@ -465,7 +519,7 @@ namespace MyTaskbar
         void SetAutoConnect(string profileName, bool auto)
         {
             if (string.IsNullOrEmpty(profileName)) return;
-            Task.Run(() =>
+            _ = Task.Run(() =>
             {
                 try
                 {
@@ -495,7 +549,7 @@ namespace MyTaskbar
             {
                 ConnectedSignal = con.Signal;
                 ConnectedSsidLabel.Text = con.SSID;
-                ConnectedStatusLabel.Text = con.Secured ? "Подключено, защищено" : "Подключено";
+                ConnectedStatusLabel.Text = con.Secured ? "Connected, secured" : "Connected";
 
                 var sigElement = MakeSignalBars(con.Signal, con.Secured);
                 ConnectedIcon.Content = sigElement;
@@ -540,7 +594,7 @@ namespace MyTaskbar
             }
 
             if (nets.Count == 0)
-                Status("Сети не найдены", "#666666");
+                Status("No networks found", "#666666");
             else
                 StatusLabel.Visibility = Visibility.Collapsed;
         }
@@ -564,7 +618,7 @@ namespace MyTaskbar
             NetworkList.Children.Clear();
             _nets.Clear();
             ClosePanel();
-            Status("Wi-Fi выключен", "#666666");
+            Status("Wi-Fi is off", "#666666");
         }
 
         static readonly SolidColorBrush _rowNormal = new SolidColorBrush(Color.FromArgb(1, 0, 0, 0));
@@ -721,22 +775,22 @@ namespace MyTaskbar
             if (_autoConnectCache.TryGetValue(net.SSID, out bool cachedValue))
             {
                 currentAuto = cachedValue;
-                Debug.WriteLine($"[WifiWindow] OpenPanel: из КЭШ '{net.SSID}' = {currentAuto}");
+                Debug.WriteLine($"[WifiWindow] OpenPanel: from CACHE '{net.SSID}' = {currentAuto}");
             }
             else if (net.HasProfile)
             {
                 currentAuto = GetAutoConnect(net.ProfileName);
-                Debug.WriteLine($"[WifiWindow] OpenPanel: из СИСТЕМЫ '{net.SSID}' = {currentAuto}");
+                Debug.WriteLine($"[WifiWindow] OpenPanel: from SYSTEM '{net.SSID}' = {currentAuto}");
             }
             else
             {
                 currentAuto = false;
-                Debug.WriteLine($"[WifiWindow] OpenPanel: НОВАЯ сеть '{net.SSID}'");
+                Debug.WriteLine($"[WifiWindow] OpenPanel: NEW network '{net.SSID}'");
             }
 
             var chk = new CheckBox
             {
-                Content = "Подключаться автоматически",
+                Content = "Connect automatically",
                 IsChecked = currentAuto,
                 Foreground = new SolidColorBrush(Color.FromRgb(200, 200, 200)),
                 FontSize = 11,
@@ -752,13 +806,13 @@ namespace MyTaskbar
                 {
                     SetAutoConnect(net.ProfileName, true);
                     _autoConnectCache[net.SSID] = true;
-                    Debug.WriteLine($"[WifiWindow] Чекбокс ВКЛ для '{net.SSID}'");
+                    Debug.WriteLine($"[WifiWindow] Checkbox ON for '{net.SSID}'");
                 };
                 chk.Unchecked += (s, e) =>
                 {
                     SetAutoConnect(net.ProfileName, false);
                     _autoConnectCache[net.SSID] = false;
-                    Debug.WriteLine($"[WifiWindow] Чекбокс ВЫКЛ для '{net.SSID}'");
+                    Debug.WriteLine($"[WifiWindow] Checkbox OFF for '{net.SSID}'");
                 };
             }
             else
@@ -776,7 +830,7 @@ namespace MyTaskbar
             {
                 stack.Children.Add(new TextBlock
                 {
-                    Text = "Введите ключ безопасности сети",
+                    Text = "Enter the network security key",
                     Foreground = new SolidColorBrush(Color.FromRgb(170, 170, 170)),
                     FontSize = 11,
                     FontFamily = new FontFamily("Segoe UI"),
@@ -869,9 +923,6 @@ namespace MyTaskbar
                 stack.Children.Add(errLbl);
             }
 
-            // ════════════════════════════════════════════════════════════
-            // ✅ ИЗМЕНЕНИЕ: кнопки выровнены по правому краю (как Win 10)
-            // ════════════════════════════════════════════════════════════
             var btns = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
@@ -881,7 +932,7 @@ namespace MyTaskbar
 
             var conBtn = new Button
             {
-                Content = "Подключить",
+                Content = "Connect",
                 FontSize = 12,
                 FontFamily = new FontFamily("Segoe UI"),
                 Foreground = Brushes.White,
@@ -899,7 +950,7 @@ namespace MyTaskbar
                     : null;
                 if (net.Secured && pwdBox != null && (pwd?.Length ?? 0) < 8)
                 {
-                    if (errLbl != null) { errLbl.Text = "Минимум 8 символов"; errLbl.Visibility = Visibility.Visible; }
+                    if (errLbl != null) { errLbl.Text = "Minimum 8 characters"; errLbl.Visibility = Visibility.Visible; }
                     return;
                 }
                 bool auto = chk.IsChecked == true;
@@ -912,7 +963,7 @@ namespace MyTaskbar
             {
                 var forBtn = new Button
                 {
-                    Content = "Забыть",
+                    Content = "Forget",
                     FontSize = 12,
                     FontFamily = new FontFamily("Segoe UI"),
                     Foreground = Brushes.White,
@@ -946,15 +997,15 @@ namespace MyTaskbar
 
         void Connect(Net net, string pwd, bool auto)
         {
-            Status($"Подключение к «{net.SSID}»…", "#55CC77");
+            Status($"Connecting to \"{net.SSID}\"…", "#55CC77");
             _connecting = true;
 
-            Task.Run(() =>
+            _ = Task.Run(() =>
             {
                 try
                 {
                     _autoConnectCache[net.SSID] = auto;
-                    Debug.WriteLine($"[WifiWindow] Connect: сохранили КЭШ '{net.SSID}' = {auto}");
+                    Debug.WriteLine($"[WifiWindow] Connect: saved CACHE '{net.SSID}' = {auto}");
 
                     string mode = auto ? "auto" : "manual";
 
@@ -1021,7 +1072,7 @@ namespace MyTaskbar
                         if (setResult != 0)
                         {
                             _connecting = false;
-                            Dispatcher.Invoke(() => Status($"Ошибка профиля ({setResult})", "#FF6060"));
+                            Dispatcher.Invoke(() => Status($"Profile error ({setResult})", "#FF6060"));
                             return;
                         }
 
@@ -1057,7 +1108,7 @@ namespace MyTaskbar
                 {
                     Debug.WriteLine($"[WifiWindow] Connect error: {ex.Message}");
                     _connecting = false;
-                    Dispatcher.Invoke(() => Status("Ошибка подключения", "#FF6060"));
+                    Dispatcher.Invoke(() => Status("Connection error", "#FF6060"));
                 }
             });
         }
@@ -1081,7 +1132,7 @@ namespace MyTaskbar
             ConnectedSignal = -1;
             ConnectedBlock.Visibility = Visibility.Collapsed;
             DisconnectBlock.Visibility = Visibility.Collapsed;
-            Status("Отключено", "#AAAAAA");
+            Status("Disconnected", "#AAAAAA");
             Delay(1500, BgScan);
         }
 
@@ -1093,7 +1144,7 @@ namespace MyTaskbar
                 !string.IsNullOrEmpty(net.ProfileName) ? net.ProfileName : net.SSID,
                 IntPtr.Zero);
             _autoConnectCache.Remove(net.SSID);
-            Status($"Сеть «{net.SSID}» забыта", "#AAAAAA");
+            Status($"Network \"{net.SSID}\" forgotten", "#AAAAAA");
             Delay(800, BgScan);
         }
 
@@ -1148,6 +1199,11 @@ namespace MyTaskbar
             return _cachedAdapterName ?? "";
         }
 
+        // ════════════════════════════════════════════════════════════════
+        //  Включение / выключение Wi-Fi (без прав администратора)
+        //  Приоритет: WinRT Radio API → WlanAPI → ничего
+        // ════════════════════════════════════════════════════════════════
+
         void SetWifiAdapter(bool enable)
         {
             _adapterToggling = true;
@@ -1160,66 +1216,177 @@ namespace MyTaskbar
                 OffState();
             }
 
-            Task.Run(() =>
+            // async void — запускаем асинхронную цепочку из синхронного контекста
+            _ = SetWifiAdapterAsync(enable);
+        }
+
+        async Task SetWifiAdapterAsync(bool enable)
+        {
+            bool success = false;
+
+            if (enable)
             {
-                bool success = false;
+                // ══ ВКЛЮЧЕНИЕ ════════════════════════════════════════════
+                // После RequestAccessAsync WinRT видит выключенное радио тоже.
+
+                // 1. WinRT Radio API (приоритет)
                 try
                 {
-                    success = SetRadioViaWlanApi(enable);
-                    Debug.WriteLine($"[WifiWindow] WlanSetInterface radio: success={success}");
+                    success = await SetRadioViaWinRT(true);
+                    Debug.WriteLine($"[WifiWindow] WinRT Radio enable: success={success}");
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"[WifiWindow] WlanSetInterface error: {ex.Message}");
+                    Debug.WriteLine($"[WifiWindow] WinRT Radio enable error: {ex.Message}");
                 }
 
+                // 2. Fallback: WlanAPI opCode=7
                 if (!success)
                 {
                     try
                     {
-                        var psi2 = new ProcessStartInfo("netsh", $"interface set interface \"{GetWifiAdapterName()}\" {(enable ? "enable" : "disable")}")
-                        {
-                            UseShellExecute = false,
-                            CreateNoWindow = true
-                        };
-                        using (var p2 = Process.Start(psi2))
-                            p2?.WaitForExit(3000);
+                        success = SetRadioViaWlanApi(true);
+                        Debug.WriteLine($"[WifiWindow] WlanSetInterface enable: success={success}");
                     }
-                    catch (Exception ex2)
+                    catch (Exception ex)
                     {
-                        Debug.WriteLine($"[WifiWindow] netsh fallback error: {ex2.Message}");
+                        Debug.WriteLine($"[WifiWindow] WlanSetInterface enable error: {ex.Message}");
                     }
                 }
 
-                for (int i = 0; i < 8; i++)
+                // 3. Последний шанс: PowerShell Enable-NetAdapter
+                if (!success)
                 {
-                    Thread.Sleep(250);
+                    try
+                    {
+                        string adapterName = GetWifiAdapterName();
+                        if (!string.IsNullOrEmpty(adapterName))
+                        {
+                            var psi = new ProcessStartInfo("powershell.exe",
+                                $"-NoProfile -NonInteractive -WindowStyle Hidden " +
+                                $"-Command \"Enable-NetAdapter -Name '{adapterName}' -Confirm:$false\"")
+                            {
+                                UseShellExecute = false,
+                                CreateNoWindow = true
+                            };
+                            using (var p = Process.Start(psi))
+                            {
+                                p?.WaitForExit(5000);
+                                success = true;
+                            }
+                            Debug.WriteLine($"[WifiWindow] PowerShell Enable-NetAdapter sent");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[WifiWindow] PowerShell enable error: {ex.Message}");
+                    }
+                }
+            }
+            else
+            {
+                // ══ ВЫКЛЮЧЕНИЕ ═══════════════════════════════════════════
+                // WinRT видит включённый адаптер — используем его первым,
+                // так как это самый надёжный способ без прав администратора.
+
+                // 1. WinRT Radio API
+                try
+                {
+                    success = await SetRadioViaWinRT(false);
+                    Debug.WriteLine($"[WifiWindow] WinRT Radio disable: success={success}");
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[WifiWindow] WinRT Radio disable error: {ex.Message}");
+                }
+
+                // 2. Fallback: WlanAPI opCode=7
+                if (!success)
+                {
+                    try
+                    {
+                        success = SetRadioViaWlanApi(false);
+                        Debug.WriteLine($"[WifiWindow] WlanSetInterface disable: success={success}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[WifiWindow] WlanSetInterface disable error: {ex.Message}");
+                    }
+                }
+            }
+
+            // ── Ждём применения в фоне ───────────────────────────────────
+            await Task.Run(() =>
+            {
+                for (int i = 0; i < 16; i++)
+                {
+                    Thread.Sleep(300);
                     bool current = AdapterOn();
                     if (enable ? current : !current) break;
                 }
-
-                Dispatcher.Invoke(() =>
-                {
-                    _adapterToggling = false;
-                    bool real = AdapterOn();
-                    _wifiOn = real;
-                    SetWifiTile(real);
-
-                    if (!real)
-                    {
-                        ConnectedSignal = -1;
-                        _cachedNets.Clear();
-                        OffState();
-                    }
-                    else
-                    {
-                        StatusLabel.Visibility = Visibility.Collapsed;
-                        BgScan();
-                    }
-                });
             });
+
+            // ── Обновляем UI ─────────────────────────────────────────────
+            _adapterToggling = false;
+            bool real = AdapterOn();
+            _wifiOn = real;
+            SetWifiTile(real);
+
+            if (!real)
+            {
+                ConnectedSignal = -1;
+                _cachedNets.Clear();
+                OffState();
+            }
+            else
+            {
+                StatusLabel.Visibility = Visibility.Collapsed;
+                BgScan();
+            }
         }
 
+        // ── WinRT: Radio.SetStateAsync — работает без UAC ────────────────
+        // GetRadiosAsync() возвращает ВСЕ радио включая выключенные программно.
+        // Предварительно вызываем RequestAccessAsync() чтобы получить разрешение.
+        async Task<bool> SetRadioViaWinRT(bool enable)
+        {
+            try
+            {
+                // Запрашиваем разрешение на управление радио (обязательно для включения)
+                var access = await Radio.RequestAccessAsync();
+                Debug.WriteLine($"[WifiWindow] WinRT RequestAccess result={access}");
+
+                if (access != RadioAccessStatus.Allowed)
+                    return false;
+
+                var radios = await Radio.GetRadiosAsync();
+                Debug.WriteLine($"[WifiWindow] WinRT GetRadiosAsync: found {radios.Count} radio(s)");
+
+                bool any = false;
+                foreach (var radio in radios)
+                {
+                    Debug.WriteLine($"[WifiWindow] WinRT Radio: Kind={radio.Kind} State={radio.State} Name={radio.Name}");
+                    if (radio.Kind == RadioKind.WiFi)
+                    {
+                        RadioState targetState = enable ? RadioState.On : RadioState.Off;
+                        RadioAccessStatus result = await radio.SetStateAsync(targetState);
+                        Debug.WriteLine($"[WifiWindow] WinRT SetState={targetState} result={result}");
+
+                        if (result == RadioAccessStatus.Allowed)
+                            any = true;
+                    }
+                }
+
+                return any;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[WifiWindow] SetRadioViaWinRT: {ex.Message}");
+                return false;
+            }
+        }
+
+        // ── WlanAPI opCode=7: второй вариант без UAC ─────────────────────
         bool SetRadioViaWlanApi(bool enable)
         {
             if (_wlan == IntPtr.Zero || _iface == Guid.Empty) return false;
@@ -1247,6 +1414,10 @@ namespace MyTaskbar
                 return false;
             }
         }
+
+        // ════════════════════════════════════════════════════════════════
+        //  Обработчики кнопок
+        // ════════════════════════════════════════════════════════════════
 
         void DisconnectButton_Click(object sender, RoutedEventArgs e) => Disconnect();
 

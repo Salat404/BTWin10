@@ -1,4 +1,4 @@
-﻿<Window x:Class="MyTaskbar.MenuWindow"
+<Window x:Class="MyTaskbar.MenuWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Menu"
@@ -13,19 +13,19 @@
 
     <Border Background="Transparent"
             BorderBrush="#22FFFFFF"
-            BorderThickness="0,0,0,1"
+            BorderThickness="0,1,1,1"
             CornerRadius="0">
         <StackPanel>
 
             <!-- Верхняя панель управления -->
-            <Grid Height="36" Background="#40000000">
+            <Grid x:Name="TopBarGrid" Height="36" Background="#40000000">
                 <Grid.ColumnDefinitions>
                     <!-- Колонка для кнопки питания + выезжающих кнопок -->
-                    <ColumnDefinition Width="36"/>
+                    <ColumnDefinition x:Name="ColPower" Width="36"/>
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="36"/>
-                    <ColumnDefinition Width="36"/>
+                    <ColumnDefinition x:Name="ColSearch" Width="36"/>
+                    <ColumnDefinition x:Name="ColSettings" Width="36"/>
                 </Grid.ColumnDefinitions>
 
                 <!-- ⏻ Питание / Shutdown -->

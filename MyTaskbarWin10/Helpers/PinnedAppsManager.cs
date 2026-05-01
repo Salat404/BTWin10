@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -47,11 +47,11 @@ namespace MyTaskbar.Helpers
                     File.Delete(SavePath);
                 File.Move(tmp, SavePath);
 
-                Debug.WriteLine($"[PinnedAppsManager] Сохранено {apps.Count} приложений → {SavePath}");
+                Debug.WriteLine($"[PinnedAppsManager] Saved {apps.Count} apps → {SavePath}");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[PinnedAppsManager] ОШИБКА Save: {ex}");
+                Debug.WriteLine($"[PinnedAppsManager] ERROR Save: {ex}");
             }
         }
 
@@ -63,7 +63,7 @@ namespace MyTaskbar.Helpers
             {
                 if (!File.Exists(SavePath))
                 {
-                    Debug.WriteLine($"[PinnedAppsManager] Файл не найден, создаём дефолт: {SavePath}");
+                    Debug.WriteLine($"[PinnedAppsManager] File not found, creating default: {SavePath}");
                     var def = GetDefaults();
                     Save(def);
                     return def;
@@ -77,7 +77,7 @@ namespace MyTaskbar.Helpers
                 // Убираем записи с пустым путём
                 loaded.RemoveAll(a => string.IsNullOrWhiteSpace(a?.Path));
 
-                Debug.WriteLine($"[PinnedAppsManager] Загружено {loaded.Count} приложений из {SavePath}");
+                Debug.WriteLine($"[PinnedAppsManager] Loaded {loaded.Count} apps from {SavePath}");
                 foreach (var a in loaded)
                     Debug.WriteLine($"  · {a.Name} | {a.Path}");
 
@@ -85,7 +85,7 @@ namespace MyTaskbar.Helpers
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[PinnedAppsManager] ОШИБКА Load: {ex}");
+                Debug.WriteLine($"[PinnedAppsManager] ERROR Load: {ex}");
                 return GetDefaults();
             }
         }
@@ -103,7 +103,7 @@ namespace MyTaskbar.Helpers
             if (!File.Exists(explorerPath))
                 explorerPath = "explorer.exe";
 
-            list.Add(new PinnedApp("explorer", explorerPath, "Проводник"));
+            list.Add(new PinnedApp("explorer", explorerPath, "Explorer"));
             return list;
         }
 

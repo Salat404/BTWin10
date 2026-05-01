@@ -1,0 +1,21 @@
+<Window x:Class="MyTaskbar.FullscreenBlockerWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="FullscreenBlocker"
+        AllowsTransparency="True"
+        Background="Transparent"
+        WindowStyle="None"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ResizeMode="NoResize"
+        Left="0" Top="0">
+    <!--
+        Прозрачный полноэкранный блок-оверлей.
+        Единственная задача — удерживать курсор пока видна панель задач,
+        не позволяя мыши уйти обратно в игру.
+        Клик вне зоны тулбара = закрыть блокер + вернуть фокус игре.
+    -->
+    <Grid Background="#01000000"
+          MouseDown="Grid_MouseDown"
+          MouseRightButtonDown="Grid_MouseDown" />
+</Window>
