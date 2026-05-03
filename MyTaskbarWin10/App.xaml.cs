@@ -80,10 +80,34 @@ namespace MyTaskbar
                 // Небольшая пауза чтобы Windows успела убрать окна
                 Thread.Sleep(500);
 
-                // Запускаем explorer.exe заново
+                // Запускаем explorer.exe заново — без аргументов чтобы он поднял
+                // оболочку (Progman, рабочий стол, иконки) нормально.
                 Process.Start(new ProcessStartInfo("explorer.exe")
                 {
                     UseShellExecute = true
+                });
+
+                // [FIX-EXPLORER-WINDOW] explorer.exe без аргументов также открывает окно
+                // "Этот компьютер" (CabinetWClass). Ждём его появления и сразу закрываем.
+                Task.Run(() =>
+                {
+                    const int maxMs = 5000;
+                    int elapsed = 0;
+                    while (elapsed < maxMs)
+                    {
+                        Thread.Sleep(100);
+                        elapsed += 100;
+                        IntPtr cabinet = FindWindow("CabinetWClass", null);
+                        if (cabinet != IntPtr.Zero)
+                        {
+                            // SW_HIDE = 0, затем PostMessage WM_CLOSE = 0x0010
+                            ShowWindow(cabinet, 0);
+                            System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                            // Посылаем WM_CLOSE чтобы закрыть окно
+                            PostMessage(cabinet, 0x0010, IntPtr.Zero, IntPtr.Zero);
+                            break;
+                        }
+                    }
                 });
             }
             catch { }
@@ -128,6 +152,8 @@ namespace MyTaskbar
         static extern int ShowWindow(IntPtr hwnd, int cmd);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         static extern bool MoveWindow(IntPtr hWnd, int x, int y, int w, int h, bool repaint);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
         static void HideSystemTaskbarImmediate()
         {
             try

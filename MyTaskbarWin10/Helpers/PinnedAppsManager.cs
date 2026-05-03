@@ -77,6 +77,19 @@ namespace MyTaskbar.Helpers
                 // Убираем записи с пустым путём
                 loaded.RemoveAll(a => string.IsNullOrWhiteSpace(a?.Path));
 
+                // [MIGRATION] Заменяем русский тултип Проводника на английский
+                foreach (var a in loaded)
+                {
+                    if (a != null &&
+                        string.Equals(System.IO.Path.GetFileNameWithoutExtension(a.Path), "explorer", StringComparison.OrdinalIgnoreCase) &&
+                        (a.Tooltip == "Проводник" || a.Name == "Проводник"))
+                    {
+                        if (a.Tooltip == "Проводник") a.Tooltip = "File Explorer";
+                        if (a.Name == "Проводник") a.Name = "explorer";
+                        Debug.WriteLine("[PinnedAppsManager] Migrated explorer tooltip RU→EN");
+                    }
+                }
+
                 Debug.WriteLine($"[PinnedAppsManager] Loaded {loaded.Count} apps from {SavePath}");
                 foreach (var a in loaded)
                     Debug.WriteLine($"  · {a.Name} | {a.Path}");
