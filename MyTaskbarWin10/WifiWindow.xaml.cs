@@ -245,6 +245,81 @@ namespace MyTaskbar
             });
         }
 
+        // [FIX-SECONDARY-POS] Показать WiFi окно на конкретном мониторе.
+        // Параметры — границы монитора в DIP + высота панели.
+        public void ShowAtMonitor(double monLeft, double monRight, double monTop,
+                                  double monBottom, double taskbarH, bool isBottom)
+        {
+            _wifiOn = AdapterOn();
+            SetWifiTile(_wifiOn);
+
+            if (_wifiOn)
+            {
+                if (_cachedNets.Count > 0) { Rebuild(_cachedNets); StatusLabel.Visibility = Visibility.Collapsed; }
+                else Status("Scanning…", "#888888");
+            }
+            else { OffState(); }
+
+            double monH = monBottom - monTop;
+            double monW = monRight  - monLeft;
+            Height = monH / 2.0;
+
+            Visibility = Visibility.Visible;
+            UpdateLayout();
+
+            double winW = ActualWidth > 0 ? ActualWidth : Width;
+            // Прижимаем к правому краю монитора (как оригинал на первом экране)
+            Left = monRight - winW;
+
+            if (isBottom)
+            {
+                RootBorder.BorderThickness = new Thickness(0, 1, 0, 0);
+                Top = monBottom + 100; // временно за экраном
+                // [FIX-BOTTOM-GAP] Используем Render-приоритет: к этому моменту
+                // ActualHeight уже содержит финальный размер после layout-прохода.
+                Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Render, new Action(() =>
+                {
+                    InvalidateMeasure(); InvalidateArrange(); UpdateLayout();
+                    double h = ActualHeight > 0 ? ActualHeight : Height;
+                    double w = ActualWidth  > 0 ? ActualWidth  : Width;
+                    // Вплотную к нижнему краю монитора (без отступа на высоту панели)
+                    Top  = monBottom - h;
+                    Left = monRight  - w;
+                    Activate();
+                    // Страховка: если ActualHeight изменится при первом рендере — подправляем
+                    void OnSizeChanged(object ss, SizeChangedEventArgs se)
+                    {
+                        SizeChanged -= OnSizeChanged;
+                        double hh = ActualHeight > 0 ? ActualHeight : Height;
+                        double ww = ActualWidth  > 0 ? ActualWidth  : Width;
+                        Top  = monBottom - hh;
+                        Left = monRight  - ww;
+                    }
+                    SizeChanged += OnSizeChanged;
+                }));
+            }
+            else
+            {
+                RootBorder.BorderThickness = new Thickness(0, 0, 0, 1);
+                // Режим «панель сверху» — меню идёт от верхнего края монитора вниз
+                Top = monTop;
+                Activate();
+            }
+
+            _refresh?.Stop();
+            _refresh = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+            _refresh.Tick += (s, e) =>
+            {
+                if (_adapterToggling || _connecting) return;
+                bool real = AdapterOn();
+                if (real != _wifiOn) { _wifiOn = real; SetWifiTile(real); if (!real) { ConnectedSignal = -1; OffState(); return; } }
+                if (real) BgScan();
+            };
+            _refresh.Start();
+
+            if (_wifiOn && (DateTime.Now - _cacheTime).TotalSeconds > 10) BgScan();
+        }
+
         public void ShowAt(double unused, double unused2)
         {
             _wifiOn = AdapterOn();
@@ -282,16 +357,28 @@ namespace MyTaskbar
                 // Панель внизу — прижимаем меню вплотную над ней
                 Top = screenH; // временно за экраном
                 RootBorder.BorderThickness = new Thickness(0, 1, 0, 0); // сверху
-                Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(() =>
+                Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Render, new Action(() =>
                 {
                     InvalidateMeasure();
                     InvalidateArrange();
                     UpdateLayout();
                     double h = ActualHeight > 0 ? ActualHeight : Height;
+                    double w = ActualWidth  > 0 ? ActualWidth  : Width;
                     // WorkArea.Bottom = верхний край нашей панели (панель зарезервировала низ)
                     double panelTop = SystemParameters.WorkArea.Bottom;
-                    Top = panelTop - h;
+                    Top  = panelTop - h;
+                    Left = screenW  - w;
                     Activate();
+                    // Страховка на случай изменения размера при первом рендере
+                    void OnSizeChanged(object ss, SizeChangedEventArgs se)
+                    {
+                        SizeChanged -= OnSizeChanged;
+                        double hh = ActualHeight > 0 ? ActualHeight : Height;
+                        double ww = ActualWidth  > 0 ? ActualWidth  : Width;
+                        Top  = SystemParameters.WorkArea.Bottom - hh;
+                        Left = SystemParameters.PrimaryScreenWidth - ww;
+                    }
+                    SizeChanged += OnSizeChanged;
                 }));
             }
             else
@@ -335,19 +422,20 @@ namespace MyTaskbar
                     new IntPtr(l.ToInt64() + Marshal.SizeOf<WLAN_INTERFACE_INFO_LIST>()));
                 Debug.WriteLine($"[WifiWindow] AdapterOn: State={i.State}");
 
-                // Состояния WLAN_INTERFACE_STATE:
-                //  0 = not_ready      — адаптер не готов / выключен
-                //  1 = connected      — подключён        ← включён
-                //  2 = ad_hoc         — ad-hoc           ← включён
-                //  3 = disconnecting  — отключается      ← включён
-                //  4 = disconnected   — радио выключено WinRT/airplane mode ← ВЫКЛЮЧЕН
-                //  5 = associating    — подключается     ← включён
-                //  6 = discovering    — сканирует        ← включён
-                //  7 = authenticating — аутентификация   ← включён
+                // Состояния WLAN_INTERFACE_STATE (winlanapi.h):
+                //  0 = wlan_interface_state_not_ready       — адаптер не инициализирован / выключен аппаратно
+                //  1 = wlan_interface_state_connected        — подключён к сети              ← включён
+                //  2 = wlan_interface_state_ad_hoc_net_formed— ad-hoc                        ← включён
+                //  3 = wlan_interface_state_disconnecting    — разрывает соединение          ← включён
+                //  4 = wlan_interface_state_disconnected     — НЕ ПОДКЛЮЧЁН К СЕТИ, но радио работает ← включён
+                //  5 = wlan_interface_state_associating      — подключается                  ← включён
+                //  6 = wlan_interface_state_discovering      — сканирует                     ← включён
+                //  7 = wlan_interface_state_authenticating   — аутентификация                ← включён
                 //
-                // State=4 после WinRT SetState(Off) — это "радио выключено",
-                // возвращаем false чтобы тайл стал серым.
-                return i.State != 0 && i.State != 4;
+                // State=0 означает «адаптер не готов» (аппаратно выключен, airplane mode,
+                // драйвер не загружен). Все остальные состояния — адаптер работает.
+                // State=4 — это просто «нет ассоциации», НЕ «радио выключено».
+                return i.State != 0;
             }
             catch { return false; }
             finally { if (l != IntPtr.Zero) WlanFreeMemory(l); }
@@ -543,6 +631,29 @@ namespace MyTaskbar
         {
             bool same = NetsEqual(_nets, nets);
             _nets = nets;
+
+            // [FIX-PASSWORD] Если панель с вводом пароля открыта — не перестраиваем список.
+            // Иначе каждые 5 секунд сканирование сбрасывает введённый пароль.
+            // Обновляем только ConnectedBlock/DisconnectBlock, сам список не трогаем.
+            if (_panel != null)
+            {
+                var con2 = nets.Find(n => n.Connected);
+                if (con2 != null)
+                {
+                    ConnectedSignal = con2.Signal;
+                    ConnectedSsidLabel.Text = con2.SSID;
+                    ConnectedStatusLabel.Text = con2.Secured ? "Connected, secured" : "Connected";
+                    ConnectedBlock.Visibility = Visibility.Visible;
+                    DisconnectBlock.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    ConnectedSignal = -1;
+                    ConnectedBlock.Visibility = Visibility.Collapsed;
+                    DisconnectBlock.Visibility = Visibility.Collapsed;
+                }
+                return;
+            }
 
             var con = nets.Find(n => n.Connected);
             if (con != null)
@@ -1021,11 +1132,11 @@ namespace MyTaskbar
                         {
                             xml = "<?xml version=\"1.0\"?>"
                                 + "<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
-                                + "<n>" + EscapeXml(net.SSID) + "</n>"
+                                + "<name>" + EscapeXml(net.SSID) + "</name>"
                                 + "<SSIDConfig>"
                                 + "<SSID>"
                                 + "<hex>" + hexSsid + "</hex>"
-                                + "<n>" + EscapeXml(net.SSID) + "</n>"
+                                + "<name>" + EscapeXml(net.SSID) + "</name>"
                                 + "</SSID>"
                                 + "</SSIDConfig>"
                                 + "<connectionType>ESS</connectionType>"
@@ -1047,11 +1158,11 @@ namespace MyTaskbar
                         {
                             xml = "<?xml version=\"1.0\"?>"
                                 + "<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">"
-                                + "<n>" + EscapeXml(net.SSID) + "</n>"
+                                + "<name>" + EscapeXml(net.SSID) + "</name>"
                                 + "<SSIDConfig>"
                                 + "<SSID>"
                                 + "<hex>" + hexSsid + "</hex>"
-                                + "<n>" + EscapeXml(net.SSID) + "</n>"
+                                + "<name>" + EscapeXml(net.SSID) + "</name>"
                                 + "</SSID>"
                                 + "</SSIDConfig>"
                                 + "<connectionType>ESS</connectionType>"

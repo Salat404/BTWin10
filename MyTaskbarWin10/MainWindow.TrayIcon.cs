@@ -33,6 +33,10 @@ namespace MyTaskbar
         // ═════════════════════════════════════════════════════════════════════
         void LoadPinnedApps()
         {
+            // Обновляем устаревшие пути для versioned-приложений (Discord, Slack…)
+            // до загрузки, чтобы Load() сразу получил актуальные пути.
+            PinnedAppsManager.RefreshVersionedPaths();
+
             List<PinnedApp> apps;
             try { apps = PinnedAppsManager.Load() ?? new List<PinnedApp>(); }
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] LoadPinnedApps: {ex.Message}"); return; }

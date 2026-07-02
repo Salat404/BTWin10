@@ -56,7 +56,7 @@ namespace MyTaskbar
             if (g.Hwnds.Count == 0)
             {
                 string baseTitle = g.PinnedTooltip ?? g.ExeName;
-                if (g.LastTitle != baseTitle) { g.Button.ToolTip = baseTitle; g.LastTitle = baseTitle; }
+                if (g.LastTitle != baseTitle) { if (g.Button.ToolTip is ToolTip tt0) tt0.Content = baseTitle; else g.Button.ToolTip = baseTitle; g.LastTitle = baseTitle; }
                 return;
             }
             try
@@ -65,6 +65,16 @@ namespace MyTaskbar
                 // берём первый заголовок, который не совпадает с именем window-class (технический)
                 // и не содержит только имя exe. Это гарантирует что "Team Fortress 2 - Direct3D"
                 // будет выбран вместо "D3DProxyWindow" даже если proxy-окно стоит первым.
+                
+                // [TELEGRAM-FIX] Для Telegram используем имя приложения вместо названия окна
+                // которое содержит имя аккаунта и количество сообщений
+                if (g.ExeName.ToLower().Contains("telegram"))
+                {
+                    string title = g.Hwnds.Count == 1 ? "Telegram" : $"Telegram ({g.Hwnds.Count} windows)";
+                    if (title != g.LastTitle) { if (g.Button.ToolTip is ToolTip tt1) tt1.Content = title; else g.Button.ToolTip = title; g.LastTitle = title; }
+                    return;
+                }
+                
                 string dn = null;
                 foreach (IntPtr hwnd in g.Hwnds)
                 {
@@ -79,8 +89,8 @@ namespace MyTaskbar
                 }
                 if (string.IsNullOrEmpty(dn)) dn = SafeGetWindowText(g.Hwnds[0]);
                 if (string.IsNullOrEmpty(dn)) dn = g.LastTitle ?? g.ExeName;
-                string title = g.Hwnds.Count == 1 ? dn : $"{dn} ({g.Hwnds.Count} windows)";
-                if (title != g.LastTitle) { g.Button.ToolTip = title; g.LastTitle = title; }
+                string title2 = g.Hwnds.Count == 1 ? dn : $"{dn} ({g.Hwnds.Count} windows)";
+                if (title2 != g.LastTitle) { if (g.Button.ToolTip is ToolTip tt1) tt1.Content = title2; else g.Button.ToolTip = title2; g.LastTitle = title2; }
             }
             catch { }
         }
@@ -92,12 +102,61 @@ namespace MyTaskbar
         {
             IntPtr active = GetForegroundWindow();
             IntPtr myHwnd; try { myHwnd = new WindowInteropHelper(this).Handle; } catch { myHwnd = IntPtr.Zero; }
-            if (active != myHwnd && active != IntPtr.Zero) _lastForegroundWindow = active;
+            
+            // [FIX-DESKTOP-EARLY] Проверяем процесс ДО сохранения в _lastForegroundWindow
+            string activeProcessName = "";
+            if (active != myHwnd && active != IntPtr.Zero)
+            {
+                try
+                {
+                    GetWindowThreadProcessId(active, out uint pid);
+                    if (pid != 0)
+                    {
+                        if (!_pidNameCache.TryGetValue(pid, out activeProcessName))
+                        {
+                            try { activeProcessName = Process.GetProcessById((int)pid).ProcessName?.ToLowerInvariant() ?? ""; }
+                            catch { activeProcessName = ""; }
+                        }
+                    }
+                }
+                catch { activeProcessName = ""; }
+            }
+            
+            // Если процесс explorer.exe при drag&drop — не обновляем _lastForegroundWindow
+            // и не будем считать его активным
+            bool isDesktopDragOp = activeProcessName == "explorer" && 
+                                   (GetKeyState(0x01) < 0 || GetKeyState(0x02) < 0); // Left или Right mouse button pressed
+            
+            if (!isDesktopDragOp && active != myHwnd && active != IntPtr.Zero)
+            {
+                _lastForegroundWindow = active;
+                // [FIX-NOACTIVATE-TOGGLE] Если реальный OS-фокус перешёл на ДРУГОЕ окно
+                // (не то, что мы сами последним активировали через таскбар) — сбрасываем
+                // флаг, чтобы следующий клик по прежней кнопке снова открывал, а не сворачивал.
+                if (_lastActivatedByTaskbar != IntPtr.Zero && _lastActivatedByTaskbar != active)
+                    _lastActivatedByTaskbar = IntPtr.Zero;
+            }
 
             if (active != myHwnd && active != IntPtr.Zero)
             {
                 var sbCls = new StringBuilder(128); GetWindowClassName(active, sbCls, sbCls.Capacity); string cls = sbCls.ToString();
-                if (cls == "Windows.UI.Core.CoreWindow" || cls == "ApplicationFrameInputSinkWindow")
+                
+                // [FIX-DESKTOP] Фильтруем Desktop/Progman
+                if (cls == "Progman")
+                {
+                    active = IntPtr.Zero;
+                }
+                else if (cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd")
+                {
+                    active = IntPtr.Zero;
+                }
+                // [FIX-DRAG-DETECTION] Если Explorer с нажатой мышью = drag операция
+                else if (isDesktopDragOp)
+                {
+                    active = IntPtr.Zero;
+                }
+                
+                if (active != IntPtr.Zero && (cls == "Windows.UI.Core.CoreWindow" || cls == "ApplicationFrameInputSinkWindow"))
                     foreach (var g in _groups.Values)
                         if (IsUwpAppName(g.ExeName) && g.Hwnds.Count > 0)
                         { IntPtr parent = active; for (int depth = 0; depth < 5; depth++) { parent = GetParent(parent); if (parent == IntPtr.Zero) break; if (g.Hwnds.Contains(parent)) { _lastForegroundWindow = parent; break; } } }
@@ -140,10 +199,11 @@ namespace MyTaskbar
                     bool running = g.Hwnds.Count > 0;
                     // [PER-WINDOW] Per-window groups match by hwnd; normal groups match by exe name
                     bool isActive;
-                    if (running && kvp.Key.Contains(":"))
+                    if (running && kvp.Key.Contains(":") && active != IntPtr.Zero)
                         isActive = g.Hwnds.Contains(active);
                     else
-                        isActive = running && string.Equals(kvp.Key, activeExe, StringComparison.OrdinalIgnoreCase);
+                        // [FIX-DESKTOP-v2] Если activeExe пустая (рабочий стол активен), не подсвечиваем приложение
+                        isActive = !string.IsNullOrEmpty(activeExe) && running && string.Equals(kvp.Key, activeExe, StringComparison.OrdinalIgnoreCase);
                     string state = isActive ? "Active" : running ? "Running" : "";
                     if (_buttonStateCache.TryGetValue(g.Button, out string old) && old == state) continue;
                     _buttonStateCache[g.Button] = state; ApplyButtonState(g.Button, state);
@@ -157,7 +217,8 @@ namespace MyTaskbar
             // [UI-SCALE-ICON] Иконка уже масштабируется через LayoutTransform MainPanel,
             // поэтому размер иконки задаём в базовых DIP (не умножаем на _uiScale) —
             // ScaleTransform на родительском элементе сделает это автоматически.
-            var btn = new Button { Style = TryFindResource("IconButton") as Style, ToolTip = tooltip };
+            var tipObj = new ToolTip { Content = tooltip };
+            var btn = new Button { Style = TryFindResource("IconButton") as Style, ToolTip = tipObj };
             btn.RenderTransform = new TranslateTransform(0, 0);
             btn.RenderTransformOrigin = new Point(0.5, 0.5);
             if (icon != null)

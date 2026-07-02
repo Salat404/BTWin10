@@ -155,10 +155,20 @@ namespace MyTaskbar
                     {
                         // [ATTENTION-NOACTIVATE] Fullscreen-игра на экране — показываем панель
                         // НЕ забирая фокус. Кнопка мигает, панель видна, игра не прерывается.
-                        _shownByAttention = true;
-                        ShowTaskbar(animate: true, noActivate: true);
-                        InstallAttentionMouseHook();
-                        Debug.WriteLine($"[ATTENTION] ShowTaskbar noActivate triggered by flash from {target.ExeName}");
+                        // [SETTING] Если пользователь выключил эту фичу — только мигаем кнопкой.
+                        if (!_attentionShowEnabled)
+                        {
+                            Debug.WriteLine($"[ATTENTION] Suppressed (attentionShow disabled) for {target.ExeName}");
+                        }
+                        else
+                        {
+                            _shownByAttention = true;
+                            ShowTaskbar(animate: true, noActivate: true);
+                            // [AUTOHIDE-FIX] Панель при attention НЕ скрывается автоматически —
+                            // она должна висеть пока пользователь не кликнет (как в Win10).
+                            InstallAttentionMouseHook();
+                            Debug.WriteLine($"[ATTENTION] ShowTaskbar noActivate triggered by flash from {target.ExeName}");
+                        }
                     }
                 }
 
@@ -242,6 +252,8 @@ namespace MyTaskbar
                 {
                     _shownByAttention = false;
                     UninstallAttentionMouseHook();
+                    // [FULLSCREEN-AUTOHIDE] Отменяем таймер — будем скрывать штатно
+                    StopFullscreenNoMouseHideTimer();
                     HideTaskbar(animate: true);
                     Debug.WriteLine("[ATTENTION] All attention cleared — auto-hiding taskbar (fullscreen active)");
                 }

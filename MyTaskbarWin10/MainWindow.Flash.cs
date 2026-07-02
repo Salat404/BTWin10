@@ -66,17 +66,16 @@ namespace MyTaskbar
             if (btn == null) return;
             try
             {
-                // [ATTENTION] Если окно стало активным — сбрасываем флаг внимания
+                // [FIX-2.7] Убрана мёртвая ветка "else if ... && state == Active" —
+                // она никогда не достигалась, т.к. state=="Active" уже обработан выше.
                 if (state == "Active")
                 {
                     var flashGroup = _groups.Values.FirstOrDefault(g => g.Button == btn);
                     if (flashGroup != null && flashGroup.NeedsAttention)
                         ClearAttention(flashGroup);
-                    else if (_flashingButtons.Contains(btn))
-                        StopFlash(_groups.Values.FirstOrDefault(g => g.Button == btn));
+                    else
+                        StopFlash(flashGroup ?? _groups.Values.FirstOrDefault(g => g.Button == btn));
                 }
-                else if (_flashingButtons.Contains(btn) && state == "Active")
-                    StopFlash(_groups.Values.FirstOrDefault(g => g.Button == btn));
 
                 // Если кнопка в attention-режиме (статичный фон) — не затирать его при Running
                 var attGroup = _groups.Values.FirstOrDefault(g => g.Button == btn);
@@ -117,17 +116,17 @@ namespace MyTaskbar
                 var source = PresentationSource.FromVisual(this);
                 double dpi = source?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
 
-                // [FIX-CENTER-v2] Считаем всё в физических пикселях, затем конвертируем.
-                // SystemParameters.PrimaryScreenWidth — в DIP, умножаем → физические пиксели экрана.
-                // ActualWidth — в DIP, умножаем → физические пиксели панели.
-                // Целочисленное деление в пикселях даёт идеальный центр без погрешности округления.
-                double screenPx = Math.Round(SystemParameters.PrimaryScreenWidth * dpi);
+                // [PRIMARY-MONITOR] Используем выбранный монитор (или системный primary)
+                var (monLeft, monTop, monWidth, monHeight) = GetPrimaryMonitorRectDip();
+
+                // Центрируем панель горизонтально на выбранном мониторе
+                double screenPx = Math.Round(monWidth * dpi);
                 double panelPx = Math.Round(ActualWidth * dpi);
                 double leftPx = Math.Floor((screenPx - panelPx) / 2.0);
-                Left = leftPx / dpi;
+                Left = monLeft + leftPx / dpi;
 
                 if (!_taskbarAnimating)
-                    Top = _isBottom ? SystemParameters.PrimaryScreenHeight - TASKBAR_HEIGHT : 0;
+                    Top = _isBottom ? monTop + monHeight - TASKBAR_HEIGHT : monTop;
                 Height = TASKBAR_HEIGHT;
 
                 // Обновляем 1px-линии поверх контента (поверх RunBar-индикаторов)

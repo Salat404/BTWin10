@@ -268,7 +268,6 @@ namespace MyTaskbar.Helpers
             }
         }
 
-        static int _writeCounter = 0;
         static void WriteLine(string line)
         {
             lock (_writerLock)

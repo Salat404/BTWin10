@@ -210,5 +210,100 @@ namespace MyTaskbar
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] LangButton_RightClick: {ex.Message}"); }
         }
 
+        // [FIX-SECONDARY-POS] Показать меню выбора языка привязанное к кнопке второй панели.
+        // placementTarget — кнопка LangButton на SecondaryTaskbarWindow.
+        public void OpenLangMenuFromSecondary(System.Windows.Controls.Button placementTarget)
+        {
+            try
+            {
+                IntPtr[] layouts = GetInstalledLayouts();
+                if (layouts.Length == 0) return;
+
+                IntPtr fgHwnd = GetForegroundWindow();
+                uint fgTid = fgHwnd != IntPtr.Zero ? GetWindowThreadProcessId(fgHwnd, IntPtr.Zero) : 0;
+                IntPtr currentHkl = fgTid != 0 ? GetKeyboardLayout(fgTid) : IntPtr.Zero;
+
+                var menuStyle = (Style)FindResource("DarkContextMenu");
+                var itemStyle = (Style)FindResource("DarkMenuItem");
+                var menu = new ContextMenu { Style = menuStyle };
+
+                foreach (IntPtr hkl in layouts)
+                {
+                    IntPtr capturedHkl = hkl;
+                    int langId = (int)(long)hkl & 0xFFFF;
+                    string twoLetter; string displayName;
+                    try
+                    {
+                        var ci = new System.Globalization.CultureInfo(langId);
+                        twoLetter = ci.TwoLetterISOLanguageName?.ToUpperInvariant() ?? "??";
+                        displayName = ci.NativeName;
+                        int paren = displayName.IndexOf('(');
+                        if (paren > 0) displayName = displayName.Substring(0, paren).Trim();
+                    }
+                    catch { twoLetter = "??"; displayName = langId.ToString("X4"); }
+
+                    bool isCurrent = (capturedHkl == currentHkl);
+                    var headerPanel = new StackPanel { Orientation = Orientation.Horizontal };
+                    headerPanel.Children.Add(new TextBlock
+                    {
+                        Text = twoLetter, FontWeight = FontWeights.SemiBold, MinWidth = 24,
+                        Margin = new Thickness(0, 0, 8, 0),
+                        Foreground = isCurrent
+                            ? new SolidColorBrush(Color.FromRgb(100, 180, 255))
+                            : new SolidColorBrush(Color.FromRgb(224, 224, 224)),
+                    });
+                    headerPanel.Children.Add(new TextBlock
+                    {
+                        Text = displayName,
+                        Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 160)),
+                        FontWeight = FontWeights.Normal,
+                    });
+
+                    var item = new MenuItem
+                    {
+                        Header = headerPanel, Style = itemStyle,
+                        FontWeight = isCurrent ? FontWeights.SemiBold : FontWeights.Normal,
+                        Tag = capturedHkl,
+                    };
+                    item.Click += (s2, e2) =>
+                    {
+                        try
+                        {
+                            IntPtr fg = GetForegroundWindow();
+                            if (fg != IntPtr.Zero)
+                            {
+                                const uint WM_INPUTLANGCHANGEREQUEST = 0x0050;
+                                PostMessage(fg, WM_INPUTLANGCHANGEREQUEST, IntPtr.Zero, capturedHkl);
+                            }
+                            ActivateKeyboardLayout(capturedHkl, 0);
+                            Dispatcher.BeginInvoke(new Action(() =>
+                            {
+                                try
+                                {
+                                    int lid = (int)(long)capturedHkl & 0xFFFF;
+                                    string l = new System.Globalization.CultureInfo(lid).TwoLetterISOLanguageName?.ToUpperInvariant() ?? "";
+                                    if (LangLabel != null) { _lastLang = l; LangLabel.Text = l; }
+                                }
+                                catch { }
+                            }));
+                        }
+                        catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] LangMenu select: {ex.Message}"); }
+                    };
+                    menu.Items.Add(item);
+                }
+
+                // Привязываем к кнопке второй панели — меню появится над/под ней
+                menu.PlacementTarget = placementTarget;
+                menu.Placement = System.Windows.Controls.Primitives.PlacementMode.Top;
+                // [FIX-LANG-HIDE] Пока контекстное меню языка открыто — панель не должна скрываться.
+                // ВАЖНО: флаг выставляем ДО menu.IsOpen = true, иначе MouseLeave срабатывает
+                // раньше события Opened и ScheduleHide() успевает запустить таймер скрытия.
+                _langContextMenuOpen = true;
+                menu.Closed += (_, __) => _langContextMenuOpen = false;
+                menu.IsOpen = true;
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] OpenLangMenuFromSecondary: {ex.Message}"); }
+        }
+
     }
 }

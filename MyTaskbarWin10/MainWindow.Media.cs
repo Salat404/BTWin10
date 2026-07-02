@@ -218,5 +218,81 @@ namespace MyTaskbar
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] VolumeButton_Click: {ex.Message}"); }
         }
 
+        // [FIX-SECONDARY-POS] Volume flyout позиционированный на втором мониторе.
+        public void OpenVolumeFromSecondary(double btnCenterX, double monBottom, double monTop,
+                                            double taskbarH, bool isBottom)
+        {
+            try
+            {
+                MarkOwnActivity();
+                if ((DateTime.UtcNow - _volumeClosedAt).TotalMilliseconds < 300) return;
+                if (_volumeFlyout == null)
+                {
+                    _volumeFlyout = new VolumeFlyoutWindow(); _volumeFlyout.UIScale = _uiScale;
+                    _volumeFlyout.IsVisibleChanged += (s2, ev) =>
+                    { if (!(bool)ev.NewValue) { _volumeClosedAt = DateTime.UtcNow; UpdateVolumeIcon(); } };
+                    _volumeFlyout.SizeChanged += (s2, ev) =>
+                    {
+                        if (!_volumeFlyout.IsVisible) return;
+                        // Перепозиционируем при изменении размера (используем последние сохранённые данные)
+                        double h2 = _volumeFlyout.ActualHeight;
+                        if (h2 <= 0) return;
+                        _volumeFlyout.Top = _volumeFlyout.Tag is bool ib && ib
+                            ? (double)(_volumeFlyout.Resources["_secMonBottom"] ?? monBottom) - taskbarH - h2 - 4
+                            : (double)(_volumeFlyout.Resources["_secMonTop"]    ?? monTop)    + taskbarH + 4;
+                    };
+                }
+                if (_volumeFlyout.IsVisible) { _volumeFlyout.Hide(); return; }
+
+                // Сохраняем данные монитора для SizeChanged
+                _volumeFlyout.Tag = isBottom;
+                _volumeFlyout.Resources["_secMonBottom"] = monBottom;
+                _volumeFlyout.Resources["_secMonTop"]    = monTop;
+
+                double vfW = _volumeFlyout.Width > 0 ? _volumeFlyout.Width : 220;
+                _volumeFlyout.Left = btnCenterX - vfW / 2;
+                _volumeFlyout.Top  = -9999;
+                _volumeFlyout.Show();
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    double h = _volumeFlyout.ActualHeight > 0 ? _volumeFlyout.ActualHeight : 80;
+                    _volumeFlyout.Top = isBottom
+                        ? monBottom - taskbarH - h - 4
+                        : monTop    + taskbarH + 4;
+                }), System.Windows.Threading.DispatcherPriority.Render);
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] OpenVolumeFromSecondary: {ex.Message}"); }
+        }
+
+        // [FIX-SECONDARY-POS] Brightness flyout позиционированный на втором мониторе.
+        public void OpenBrightnessFromSecondary(double btnCenterX, double monBottom, double monTop,
+                                                double taskbarH, bool isBottom)
+        {
+            try
+            {
+                MarkOwnActivity();
+                if ((DateTime.UtcNow - _brightnessClosedAt).TotalMilliseconds < 300) return;
+                if (_brightnessFlyout == null)
+                {
+                    _brightnessFlyout = new BrightnessFlyoutWindow(); _brightnessFlyout.UIScale = _uiScale;
+                    _brightnessFlyout.IsVisibleChanged += (s2, ev) =>
+                    { if (!(bool)ev.NewValue) { _brightnessClosedAt = DateTime.UtcNow; UpdateBrightnessIcon(); } };
+                }
+                if (_brightnessFlyout.IsVisible) { _brightnessFlyout.Hide(); return; }
+
+                double bfW   = _brightnessFlyout.Width > 0 ? _brightnessFlyout.Width : 220;
+                double bfLeft = btnCenterX - bfW / 2;
+                double bfTopFallback = isBottom
+                    ? monBottom - taskbarH - 80 - 4
+                    : monTop    + taskbarH + 4;
+                bool ib = isBottom;
+                double mb = monBottom, mt = monTop, th = taskbarH;
+                _brightnessFlyout.ShowAt(bfLeft, bfTopFallback, actualH =>
+                    ib ? mb - th - actualH - 4
+                       : mt + th + 4);
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] OpenBrightnessFromSecondary: {ex.Message}"); }
+        }
+
     }
 }

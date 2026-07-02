@@ -130,8 +130,13 @@ namespace MyTaskbar
             if (wasActive)
             {
                 e.Handled = true;
-                _lastForegroundWindow = IntPtr.Zero;
             }
+            // [FIX-DRAG-HIGHLIGHT] Всегда сбрасываем _lastForegroundWindow при отпускании,
+            // чтобы избежать ложного срабатывания условия в btn.Click при проверке
+            // "if (_lastForegroundWindow == hwnd)". Без этого Проводник, который получил
+            // фокус во время drag'а, остаётся отмечен как "уже активный" даже после
+            // отпускания, хотя на самом деле фокус давно вернулся на панель.
+            _lastForegroundWindow = IntPtr.Zero;
         }
 
         // Мышь ушла с панели во время drag'а — отменяем
@@ -152,10 +157,15 @@ namespace MyTaskbar
         {
             try
             {
-                // Строим словарь Button → AppGroup для быстрого поиска
+                // Строим словарь Button → AppGroup для быстрого поиска.
+                // [FIX] Используем только «настоящие» группы (GroupKey == ключ в _groups),
+                // пропуская алиасы per-window которые указывают на тот же Button —
+                // иначе ToDictionary падает на дублирующем ключе и сохранение не происходит.
                 var btnToGroup = _groups.Values
-                    .Where(g => g.Button != null)
-                    .ToDictionary(g => g.Button, g => g);
+                    .Where(g => g.Button != null && g.GroupKey == g.ExeName ||
+                                g.Button != null && _groups.TryGetValue(g.GroupKey ?? "", out var real) && real == g)
+                    .GroupBy(g => g.Button)
+                    .ToDictionary(grp => grp.Key, grp => grp.First());
 
                 // Проходим по кнопкам в их текущем визуальном порядке
                 int pinnedOrder = 0;
@@ -186,9 +196,15 @@ namespace MyTaskbar
             if (string.IsNullOrEmpty(exeName)) exeName = "unknown";
             if (_groups.TryGetValue(exeName, out var ex2)) { if (ex2.Icon == null && icon != null) ex2.Icon = icon; if (!string.IsNullOrEmpty(tooltip) && string.IsNullOrEmpty(ex2.PinnedTooltip)) ex2.PinnedTooltip = tooltip; return ex2; }
             bool uwpIcon = IsUwpAppName(exeName);
-            var group = new AppGroup { ExeName = exeName, GroupKey = exeName, Icon = icon, LastTitle = tooltip ?? exeName, PinnedTooltip = tooltip ?? exeName, IsUwp = uwpIcon };
+            
+            // [TELEGRAM-FIX] Для Telegram используем имя приложения вместо названия окна
+            string displayTooltip = tooltip;
+            if (exeName.ToLower().Contains("telegram"))
+                displayTooltip = "Telegram";
+            
+            var group = new AppGroup { ExeName = exeName, GroupKey = exeName, Icon = icon, LastTitle = displayTooltip ?? exeName, PinnedTooltip = displayTooltip ?? exeName, IsUwp = uwpIcon };
             Button btn;
-            try { btn = CreateAppButton(tooltip, icon, uwpIcon ? 22 : 24); }
+            try { btn = CreateAppButton(displayTooltip, icon, uwpIcon ? 22 : 24); }
             catch { btn = new Button { Content = exeName.Substring(0, Math.Min(1, exeName.Length)).ToUpper() }; }
             SetupGroupButton(btn, group);
             group.Button = btn; _groups[exeName] = group;
@@ -212,16 +228,41 @@ namespace MyTaskbar
         void SetupGroupButton(Button btn, AppGroup group)
         {
             if (btn == null || group == null) return;
+            // [FIX-SECONDARY] Tag используется SecondaryTaskbarWindow для идентификации кнопки.
+            // Без этого у всех кнопок Tag == null и клик на второй панели всегда попадает
+            // на первую кнопку в списке.
+            btn.Tag = group.GroupKey ?? group.ExeName;
             btn.MouseEnter += (s, e) =>
             {
                 try
                 {
+                    // Закрываем любой висящий тултип соседних кнопок
+                    foreach (var g in _groups.Values)
+                        if (g.Button != null && g.Button != btn && g.Button.ToolTip is ToolTip tt && tt.IsOpen)
+                            tt.IsOpen = false;
+
+                    // Тултип показываем ТОЛЬКО если программа не запущена (pinned без окон).
+                    // Если у кнопки есть хоть одно окно — тултип скрываем, т.к. вместо него
+                    // будет показано окно превью DWM. Это предотвращает наложение тултипа на превью.
+                    if (group.Hwnds.Count > 0)
+                    {
+                        // Запущенная программа: полностью блокируем тултип
+                        ToolTipService.SetIsEnabled(btn, false);
+                        // Принудительно закрываем если уже открылся
+                        if (btn.ToolTip is ToolTip thisTt && thisTt.IsOpen)
+                            thisTt.IsOpen = false;
+                    }
+                    else
+                    {
+                        // Pinned без окон: тултип разрешён
+                        ToolTipService.SetIsEnabled(btn, true);
+                    }
                     _previewHideTimer?.Stop();
                     _previewShowTimer?.Stop();
                     _pendingPreviewGroup = group;
                     _pendingPreviewBtn = btn;
-                    // [FIX-PREVIEW] Если preview уже открыт — переключаем немедленно,
-                    // без задержки 500мс. Это убирает "залипание" при наведении по очереди.
+                    _pendingPreviewIsSecondary = false; // [SECONDARY-PREVIEW] главная панель
+                    // Если preview уже открыт — переключаем немедленно
                     if (_previewWindow != null && _previewWindow.IsVisible && _currentPreviewGroup != null)
                         ShowPreview(group, btn);
                     else
@@ -233,11 +274,16 @@ namespace MyTaskbar
             {
                 try
                 {
+                    // Восстанавливаем тултип при уходе мыши
+                    ToolTipService.SetIsEnabled(btn, true);
                     _previewShowTimer?.Stop();
-                    // [FIX-PREVIEW] Сбрасываем pending только если уходим в никуда
-                    // (не в другую кнопку). Другая кнопка сразу поставит свои значения в MouseEnter.
-                    _pendingPreviewGroup = null;
-                    _pendingPreviewBtn = null;
+                    // [FIX-PREVIEW] Сбрасываем pending только если мышь ушла именно с ЭТОЙ кнопки
+                    // (не перешла на другую — та уже выставила свои pending в MouseEnter)
+                    if (_pendingPreviewBtn == btn)
+                    {
+                        _pendingPreviewGroup = null;
+                        _pendingPreviewBtn = null;
+                    }
                     ScheduleHidePreview();
                 }
                 catch { }
@@ -263,6 +309,8 @@ namespace MyTaskbar
                         // (taskmgr, regedit) — используем GetWindowPlacement через IsWindowMinimized.
                         // ShowWindow(SW_RESTORE) тоже игнорируется — используем SC_RESTORE.
                         bool minimized = IsIconic(hwnd) || IsWindowMinimized(hwnd);
+                        IntPtr fg = GetForegroundWindow();
+                        Debug.WriteLine($"[MyTaskbar] Click {group.ExeName} hwndCount=1 hwnd={hwnd:X} minimized={minimized} active={fg:X} lastFg={_lastForegroundWindow:X} lastActivatedByUs={_lastActivatedByTaskbar:X} myHwnd={_myHwnd:X}");
                         if (minimized)
                         {
                             SuspendBlockerForAppWindow();
@@ -270,21 +318,38 @@ namespace MyTaskbar
                             // работает даже для привилегированных процессов
                             PostMessage(hwnd, 0x0112 /*WM_SYSCOMMAND*/, new IntPtr(0xF120 /*SC_RESTORE*/), IntPtr.Zero);
                             SetForegroundWindow(hwnd);
+                            _lastActivatedByTaskbar = hwnd;
                             if (uwp) ActivateUwpWindow(hwnd);
                         }
-                        else if (_lastForegroundWindow == hwnd || GetForegroundWindow() == hwnd)
+                        else if (fg == hwnd || _lastForegroundWindow == hwnd
+                                 || GetAncestor(fg, GA_ROOT) == hwnd
+                                 // [FIX-NOACTIVATE-TOGGLE] Окно не приняло реальный OS-фокус (fg всё ещё
+                                 // на нашем таскбаре или где было раньше), но мы сами последними его
+                                 // "показывали" — считаем это как "уже открыто" и сворачиваем.
+                                 || _lastActivatedByTaskbar == hwnd)
                         {
                             // [FIX-TASKMGR-TOGGLE] ShowWindow(SW_MINIMIZE) игнорируется
                             // привилегированными окнами — используем SC_MINIMIZE.
                             PostMessage(hwnd, 0x0112 /*WM_SYSCOMMAND*/, new IntPtr(0xF020 /*SC_MINIMIZE*/), IntPtr.Zero);
+                            // [FIX-ELECTRON-MINIMIZE] Некоторые Electron/Chromium-окна (Discord и т.п.,
+                            // особенно frameless/компактный режим) сами перехватывают WM_SYSCOMMAND
+                            // и не передают SC_MINIMIZE в DefWindowProc — сообщение просто съедается.
+                            // Прямой ShowWindow работает в обход их message loop; для элевейтед-окон
+                            // он проигнорируется из-за UIPI, так что SC_MINIMIZE выше остаётся основным
+                            // путём для них, а этот — подстраховкой для обычных процессов.
+                            ShowWindow(hwnd, SW_MINIMIZE);
+                            _lastActivatedByTaskbar = IntPtr.Zero;
+                            Debug.WriteLine($"[MyTaskbar] Minimize path taken for {group.ExeName} hwnd={hwnd:X}");
                         }
                         else
                         {
+                            Debug.WriteLine($"[MyTaskbar] Activate(not minimize) path for {group.ExeName} hwnd={hwnd:X} active={fg:X} lastFg={_lastForegroundWindow:X}");
                             SuspendBlockerForAppWindow();
                             // [FIX-MAXIMIZE] Не посылаем SC_RESTORE если окно не минимизировано —
                             // иначе maximized-окно (Chrome в fullscreen) схлопывается до нормального размера.
                             // Просто переводим фокус на уже видимое окно.
                             SetForegroundWindow(hwnd);
+                            _lastActivatedByTaskbar = hwnd;
                             if (uwp) ActivateUwpWindow(hwnd);
                         }
                     }
@@ -293,6 +358,7 @@ namespace MyTaskbar
                         IntPtr active = GetForegroundWindow();
                         int idx = group.Hwnds.IndexOf(active);
                         IntPtr next = group.Hwnds[(idx + 1) % group.Hwnds.Count];
+                        Debug.WriteLine($"[MyTaskbar] Click {group.ExeName} hwndCount={group.Hwnds.Count} active={active:X} idx={idx} next={next:X}");
                         SuspendBlockerForAppWindow();
                         // [FIX-MAXIMIZE] Только восстанавливаем если минимизировано — иначе не трогаем WindowState
                         if (IsIconic(next) || IsWindowMinimized(next)) ShowWindow(next, SW_RESTORE);

@@ -49,6 +49,8 @@ namespace MyTaskbar
                 var hwnd = new WindowInteropHelper(_previewWindow).Handle;
                 int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
                 SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_NOACTIVATE);
+                // [FIX-2.2] Кэшируем HWND preview-окна
+                _previewHwnd = hwnd;
             };
             _previewWindow.Show(); _previewWindow.Hide();
             _previewWindow.MouseEnter += (s, e) => { _previewHideTimer?.Stop(); _previewShowTimer?.Stop(); };
@@ -56,12 +58,19 @@ namespace MyTaskbar
             if (_menuWindow != null) { _menuWindow.PreviewWindow = _previewWindow; _menuWindow.TaskbarWindow = this; }
             _previewHideTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
             _previewHideTimer.Tick += (s, e) => { _previewHideTimer.Stop(); HidePreview(); };
-            _previewShowTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1200) };
+            _previewShowTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(_previewDelayMs) };
             _previewShowTimer.Tick += (s, e) =>
             {
                 _previewShowTimer.Stop();
                 if (_pendingPreviewGroup != null && _pendingPreviewBtn != null)
-                    ShowPreview(_pendingPreviewGroup, _pendingPreviewBtn);
+                {
+                    if (_pendingPreviewIsSecondary)
+                        ShowPreviewOnMonitor(_pendingPreviewGroup, _pendingPreviewBtn,
+                            _secMonLeft, _secMonRight, _secMonTop, _secMonBottom,
+                            _secIsBottom, _secTaskbarH);
+                    else
+                        ShowPreview(_pendingPreviewGroup, _pendingPreviewBtn);
+                }
             };
             // [FIX-PREVIEW] Вспомогательный метод: показать немедленно или запустить таймер
         }
@@ -151,8 +160,8 @@ namespace MyTaskbar
                 double left = bp.X + btn.ActualWidth / 2 - tw / 2; if (left < 4) left = 4; if (left + tw > sw2 - 4) left = sw2 - tw - 4;
                 _previewWindow.Left = left;
                 _previewWindow.Top = _isBottom
-                    ? SystemParameters.PrimaryScreenHeight - TASKBAR_HEIGHT - _previewWindow.ActualHeight - 6
-                    : TASKBAR_HEIGHT + 6;
+                    ? SystemParameters.PrimaryScreenHeight - TASKBAR_HEIGHT - _previewWindow.ActualHeight +3
+                    : TASKBAR_HEIGHT -3;
                 _previewWindow.Visibility = Visibility.Visible; _previewWindow.UpdateLayout();
                 foreach (var (ts2, h) in slots) try { RegisterThumbnailForSlot(ph, h, ts2); } catch { }
             }
@@ -194,6 +203,110 @@ namespace MyTaskbar
         }
 
         void ScheduleHidePreview() { try { _previewHideTimer?.Stop(); _previewHideTimer?.Start(); } catch { } }
+
+        // ── Public API для SecondaryTaskbarWindow ──────────────────────────────
+        // [SECONDARY-PREVIEW] Показывает превью по кнопке-клону на второй панели.
+        // monLeft/monRight/monTop/monBottom — координаты монитора второй панели (DIP).
+        // taskbarH — высота тасбара в DIP. secIsBottom — расположение панели.
+        // Параметры монитора запоминаются в полях, чтобы тик _previewShowTimer их видел.
+        double _secMonLeft, _secMonRight, _secMonTop, _secMonBottom, _secTaskbarH;
+        bool   _secIsBottom, _pendingPreviewIsSecondary;
+
+        public void ShowPreviewFromSecondary(Button cloneBtn, string groupKey,
+            double monLeft, double monRight, double monTop, double monBottom,
+            bool secIsBottom, double taskbarH)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(groupKey)) return;
+                if (!_groups.TryGetValue(groupKey, out AppGroup group)) return;
+                if (group == null || group.Hwnds.Count == 0) { HidePreview(); return; }
+
+                _previewHideTimer?.Stop();
+                _previewShowTimer?.Stop();
+                _pendingPreviewGroup = group;
+                _pendingPreviewBtn   = cloneBtn;
+
+                // Сохраняем геометрию монитора — тик _previewShowTimer прочитает их из полей
+                _secMonLeft  = monLeft;  _secMonRight  = monRight;
+                _secMonTop   = monTop;   _secMonBottom = monBottom;
+                _secTaskbarH = taskbarH; _secIsBottom  = secIsBottom;
+                _pendingPreviewIsSecondary = true;
+
+                // Если превью уже открыто — переключаем немедленно
+                if (_previewWindow != null && _previewWindow.IsVisible && _currentPreviewGroup != null)
+                    ShowPreviewOnMonitor(group, cloneBtn, monLeft, monRight, monTop, monBottom, secIsBottom, taskbarH);
+                else
+                    _previewShowTimer?.Start(); // используем уже созданный таймер из InitPreviewWindow
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// HWND окна превью — используется SecondaryTaskbarWindow для hit-теста:
+        /// чтобы не скрывать панель когда курсор уходит с кнопки на окно превью.
+        /// </summary>
+        public IntPtr PreviewHwnd => _previewHwnd;
+
+        /// <summary>
+        /// Возвращает true если группа с данным ключом имеет хотя бы одно открытое окно.
+        /// Используется SecondaryTaskbarWindow для управления тултипом кнопки-клона.
+        /// </summary>
+        public bool GroupHasWindows(string groupKey)
+        {
+            if (string.IsNullOrEmpty(groupKey)) return false;
+            return _groups.TryGetValue(groupKey, out AppGroup g) && g != null && g.Hwnds.Count > 0;
+        }
+
+        public void HidePreviewFromSecondary()
+        {
+            try { _pendingPreviewIsSecondary = false; ScheduleHidePreview(); }
+            catch { }
+        }
+
+        // Версия ShowPreview с явной геометрией монитора (для второй панели)
+        void ShowPreviewOnMonitor(AppGroup group, Button btn,
+            double monLeft, double monRight, double monTop, double monBottom,
+            bool secIsBottom, double taskbarH)
+        {
+            try
+            {
+                _previewHideTimer?.Stop();
+                if (group == null || group.Hwnds.Count == 0) { HidePreview(); return; }
+                DwmIsCompositionEnabled(out bool dwm); if (!dwm) return;
+                _currentPreviewGroup = group;
+                IntPtr ph; try { ph = new WindowInteropHelper(_previewWindow).Handle; } catch { return; }
+                if (ph == IntPtr.Zero) { _previewWindow.Show(); _previewWindow.Hide(); ph = new WindowInteropHelper(_previewWindow).Handle; if (ph == IntPtr.Zero) return; }
+                UnregisterAllThumbnails();
+                int cnt = Math.Min(group.Hwnds.Count, 8);
+                double tw = cnt * (PREVIEW_CARD_WIDTH + PREVIEW_GAP * 2) + PREVIEW_PADDING * 2;
+                var ob = new Border { Background = Brushes.Transparent, BorderThickness = new Thickness(0), Padding = new Thickness(PREVIEW_PADDING), SnapsToDevicePixels = true };
+                var sp = new StackPanel { Orientation = Orientation.Horizontal, SnapsToDevicePixels = true };
+                var slots = new List<(Border, IntPtr)>(cnt);
+                for (int i = 0; i < cnt; i++)
+                {
+                    var h = group.Hwnds[i];
+                    if (!IsWindow(h)) continue;
+                    try { if (IsHungAppWindow(h)) continue; } catch { continue; }
+                    try { var (c, ts2) = CreatePreviewCard(h, group); sp.Children.Add(c); slots.Add((ts2, h)); } catch { }
+                }
+                if (sp.Children.Count == 0) { HidePreview(); return; }
+                ob.Child = sp; _previewWindow.Content = ob; _previewWindow.SizeToContent = SizeToContent.WidthAndHeight; _previewWindow.UpdateLayout();
+                var bp = btn.PointToScreen(new System.Windows.Point(0, 0));
+                double monW = monRight - monLeft;
+                double left = bp.X + btn.ActualWidth / 2 - tw / 2;
+                if (left < monLeft + 4) left = monLeft + 4;
+                if (left + tw > monRight - 4) left = monRight - tw - 4;
+                _previewWindow.Left = left;
+                _previewWindow.Top = secIsBottom
+                    ? monBottom - taskbarH - _previewWindow.ActualHeight + 3
+                    : monTop + taskbarH - 3;
+                _previewWindow.Visibility = Visibility.Visible; _previewWindow.UpdateLayout();
+                foreach (var (ts2, h) in slots) try { RegisterThumbnailForSlot(ph, h, ts2); } catch { }
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] ShowPreviewOnMonitor: {ex.Message}"); }
+        }
+
         void HidePreview()
         {
             try

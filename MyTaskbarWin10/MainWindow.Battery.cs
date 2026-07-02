@@ -49,6 +49,9 @@ namespace MyTaskbar
         {
             try
             {
+                // [BATTERY-TOGGLE] Проверяем, включён ли индикатор батареи в настройках
+                if (!_batteryIndicatorEnabled) { if (BatteryButton != null) BatteryButton.Visibility = Visibility.Collapsed; return; }
+                
                 var status = System.Windows.Forms.SystemInformation.PowerStatus;
                 bool noBatt = status.BatteryChargeStatus.HasFlag(System.Windows.Forms.BatteryChargeStatus.NoSystemBattery)
                             || status.BatteryChargeStatus == System.Windows.Forms.BatteryChargeStatus.Unknown;
@@ -79,6 +82,8 @@ namespace MyTaskbar
         {
             if (_trayWindow != null) return;
             _trayWindow = new TrayWindow(); _trayWindow.UIScale = _uiScale;
+            // [FIX-2.2] Кэшируем HWND
+            _trayWindow.SourceInitialized += (_, _e) => SafeRun(RefreshOwnHwnds, nameof(RefreshOwnHwnds));
             _trayWindow.OnTrayClosed = () =>
             {
                 _trayClosedAt = DateTime.UtcNow;
@@ -116,6 +121,41 @@ namespace MyTaskbar
                 TrayIconOpen.Visibility = Visibility.Visible;
             }
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] TrayButton_Click: {ex.Message}"); }
+        }
+
+        // [FIX-SECONDARY-POS] Трей позиционированный на втором мониторе.
+        // btnCenterX — центр кнопки в экранных координатах (DIP),
+        // monBottom/monTop — границы монитора, taskbarH — высота панели, isBottom — позиция.
+        public void OpenTrayFromSecondary(double btnCenterX, double monBottom, double monTop,
+                                          double monLeft, double monRight,
+                                          double taskbarH, bool isBottom)
+        {
+            try
+            {
+                MarkOwnActivity(); InitTrayWindow();
+                if ((DateTime.UtcNow - _trayClosedAt).TotalMilliseconds < 300) return;
+                if (_trayWindow.IsOpen)
+                {
+                    _trayWindow.SlideUp(() => Dispatcher.Invoke(() =>
+                    {
+                        _trayClosedAt = DateTime.UtcNow;
+                        if (TrayIconClosed != null) TrayIconClosed.Visibility = Visibility.Visible;
+                        if (TrayIconOpen   != null) TrayIconOpen.Visibility   = Visibility.Collapsed;
+                    }));
+                    return;
+                }
+                _trayWindow.IsBottom = isBottom;
+                // [FIX-SECONDARY-POS] Передаём границы монитора для корректного ограничения позиции
+                _trayWindow.MonLeft  = monLeft;
+                _trayWindow.MonRight = monRight;
+                double trayY = isBottom
+                    ? monBottom - taskbarH - 2
+                    : monTop    + taskbarH + 4;
+                _trayWindow.SlideDown(btnCenterX, trayY);
+                if (TrayIconClosed != null) TrayIconClosed.Visibility = Visibility.Collapsed;
+                if (TrayIconOpen   != null) TrayIconOpen.Visibility   = Visibility.Visible;
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] OpenTrayFromSecondary: {ex.Message}"); }
         }
 
     }

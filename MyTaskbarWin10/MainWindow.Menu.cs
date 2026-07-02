@@ -31,10 +31,41 @@ namespace MyTaskbar
         // ═════════════════════════════════════════════════════════════════════
         // MENU
         // ═════════════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Публичный доступ к MenuWindow для вторичной панели.
+        /// Позволяет SecondaryTaskbarWindow установить SourceMonitorRect перед ShowMenu.
+        /// </summary>
+        public MenuWindow PublicMenuWindow
+        {
+            get
+            {
+                EnsureMenuWindow();
+                Debug.WriteLine("[MainWindow.PublicMenuWindow] геттер вызван, _menuWindow=" + (_menuWindow == null ? "null" : "ok"));
+                return _menuWindow;
+            }
+        }
+
+        // [FIX-SECONDARY-HIDE] true если открыт любой попап/фрейм запущенный с панели.
+        // SecondaryTaskbarWindow проверяет это чтобы не скрыться пока открыт, например, трей или WiFi.
+        // Внимание: TrayWindow всегда Show()н (прячется за край экрана), поэтому
+        // проверяем IsOpen, а не IsVisible.
+        bool _langContextMenuOpen = false; // true пока открыто контекстное меню выбора языка
+        public bool IsAnyFlyoutOpen =>
+            (_trayWindow       != null && _trayWindow.IsOpen)          ||
+            (_wifiWindow       != null && _wifiWindow.IsVisible)       ||
+            (_volumeFlyout     != null && _volumeFlyout.IsVisible)     ||
+            (_brightnessFlyout != null && _brightnessFlyout.IsVisible) ||
+            (_calendarWindow   != null && _calendarWindow.IsVisible)   ||
+            (_menuWindow       != null && _menuWindow.IsVisible)       ||
+            _langContextMenuOpen;
+
         void EnsureMenuWindow()
         {
             if (_menuWindow != null) return;
-            _menuWindow = new MenuWindow(); _menuWindow.UIScale = _uiScale;
+            _menuWindow = new MenuWindow(); _menuWindow.UIScale = _uiScale; _menuWindow.AnimEnabled = _menuAnimEnabled;
+            // [FIX-2.2] Обновляем кэш HWND при создании MenuWindow
+            _menuWindow.SourceInitialized += (_, _e) => SafeRun(RefreshOwnHwnds, nameof(RefreshOwnHwnds));
             _menuWindow.MenuVisibilityChanged += isOpen =>
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
@@ -76,18 +107,9 @@ namespace MyTaskbar
                 if (!(bool)e.NewValue) Dispatcher.BeginInvoke(new Action(() => SetStartButtonHighlight(false)));
             };
             // [BLUR-FIX-2] Після повного завершення анімації ховання меню (меню фізично за екраном)
-            // робимо Disable→Enable toggle blur на панелі — це єдиний надійний спосіб
-            // примусити DWM скинути залишковий blur-артефакт.
-            _menuWindow.MenuHideCompleted += () =>
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    try
-                    {
-                        AcrylicHelper.Disable(this);
-                        ApplyAcrylicBackground();
-                    }
-                    catch { }
-                }), System.Windows.Threading.DispatcherPriority.Render);
+            // Disable→Enable toggle убран: он вызывал мерцание панели после закрытия меню Пуск.
+            // ApplyAcrylicBackground вызывать не нужно — акрил и так активен всё время.
+            _menuWindow.MenuHideCompleted += () => { };
             _menuWindow.TaskbarWindow = this;
             _menuWindow.PreviewWindow = _previewWindow;
         }
@@ -166,6 +188,60 @@ namespace MyTaskbar
             var t = new TranslateTransform(0, 0);
             el.RenderTransform = t; el.RenderTransformOrigin = new Point(0.5, 0.5);
             return t;
+        }
+
+        // ──────────────────────────────────────────────────────────────
+        // Calendar window (clock click handler)
+        // ──────────────────────────────────────────────────────────────
+        private CalendarWindow _calendarWindow;
+        private DateTime _calendarClosedAt = DateTime.MinValue;
+
+        private void ClockBorder_MouseLeftButtonDown(object sender, RoutedEventArgs e)
+        {
+            e.Handled = true;
+
+            try
+            {
+                MarkOwnActivity();
+                if ((DateTime.UtcNow - _calendarClosedAt).TotalMilliseconds < 300) return;
+
+                if (_calendarWindow == null)
+                {
+                    _calendarWindow = new CalendarWindow();
+                    _calendarWindow.IsVisibleChanged += (s2, ev) =>
+                    {
+                        if (!(bool)ev.NewValue)
+                        {
+                            _calendarClosedAt = DateTime.UtcNow;
+                        }
+                    };
+                }
+
+                // Если уже видно - скрыть и выйти
+                if (_calendarWindow.IsVisible)
+                {
+                    _calendarWindow.Hide();
+                    return;
+                }
+
+                // Позиционирование как у яркости/громкости
+                var button = sender as Button;
+                if (button != null)
+                {
+                    var pos = button.PointToScreen(new System.Windows.Point(0, 0));
+                    double buttonCenterX = pos.X + button.ActualWidth / 2;
+                    double calTopFallback = _isBottom
+                        ? SystemParameters.PrimaryScreenHeight - TASKBAR_HEIGHT - 180 - 4
+                        : TASKBAR_HEIGHT + 4;
+                    bool isBot = _isBottom;
+                    
+                    _calendarWindow.ShowAtCentered(buttonCenterX, calTopFallback, actualH =>
+                        isBot
+                            ? SystemParameters.PrimaryScreenHeight - TASKBAR_HEIGHT - actualH - 4
+                            : TASKBAR_HEIGHT + 4);
+                }
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] ClockBorder_MouseLeftButtonDown: {ex.Message}"); }
         }
 
     }

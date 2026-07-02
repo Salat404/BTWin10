@@ -145,6 +145,9 @@
     <Compile Include="MainWindow.Wifi.cs">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="MainWindow.Secondary.cs">
+      <DependentUpon>MainWindow.xaml</DependentUpon>
+    </Compile>
     <Compile Include="MainWindow.Language.cs">
       <DependentUpon>MainWindow.xaml</DependentUpon>
     </Compile>
@@ -195,6 +198,14 @@
       <DependentUpon>FullscreenBlockerWindow.xaml</DependentUpon>
     </Compile>
 
+    <Page Include="SecondaryTaskbarWindow.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
+    <Compile Include="SecondaryTaskbarWindow.xaml.cs">
+      <DependentUpon>SecondaryTaskbarWindow.xaml</DependentUpon>
+    </Compile>
+
     <Page Include="MenuWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
@@ -233,6 +244,17 @@
     </Page>
     <Compile Include="WifiWindow.xaml.cs">
       <DependentUpon>WifiWindow.xaml</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+  <!-- ── CalendarWindow ── -->
+  <ItemGroup>
+    <Page Include="CalendarWindow.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
+    <Compile Include="CalendarWindow.xaml.cs">
+      <DependentUpon>CalendarWindow.xaml</DependentUpon>
     </Compile>
   </ItemGroup>
 

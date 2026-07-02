@@ -63,6 +63,7 @@ namespace MyTaskbar
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT lpPoint);
         [DllImport("user32.dll", CharSet = CharSet.Auto, EntryPoint = "GetClassName")] static extern int GetWindowClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
         [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);
+        [DllImport("user32.dll")] static extern short GetKeyState(int nVirtKey);
         [DllImport("user32.dll")] static extern bool GetCursorInfo(out CURSORINFO pci);
         [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
         [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
@@ -226,6 +227,42 @@ namespace MyTaskbar
         [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
         [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
         [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(POINT_MON pt, uint dwFlags);
+        [DllImport("user32.dll")] static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProcMain lpfnEnum, IntPtr dwData);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern bool GetMonitorInfoW(IntPtr hMon, ref MONITORINFOEX lpmiEx);
+
+        delegate bool MonitorEnumProcMain(IntPtr hMon, IntPtr hdc, ref RECT lprcMonitor, IntPtr dwData);
+
+        [StructLayout(LayoutKind.Sequential)] struct POINT_MON { public int x, y; }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct MONITORINFOEX
+        {
+            public uint cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;
+        }
+
+        const uint MONITOR_DEFAULTTONEAREST_MW = 2;
+        const uint MONITORINFOF_PRIMARY = 1;
+
+        // ── Утилита: перечислить все мониторы с их именами ───────────────────
+        static List<(IntPtr hMon, RECT rc, bool isPrimary, string name)> EnumerateMonitors()
+        {
+            var result = new List<(IntPtr, RECT, bool, string)>();
+            EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
+                (IntPtr hMon, IntPtr hdc, ref RECT rcMon, IntPtr data) =>
+                {
+                    var mi = new MONITORINFOEX { cbSize = (uint)Marshal.SizeOf(typeof(MONITORINFOEX)) };
+                    if (GetMonitorInfoW(hMon, ref mi))
+                        result.Add((hMon, mi.rcMonitor, (mi.dwFlags & 1) != 0, mi.szDevice ?? ""));
+                    return true;
+                }, IntPtr.Zero);
+            return result;
+        }
         const uint GA_ROOT = 2;
 
         // Возвращает true если окно свёрнуто — работает и для привилегированных процессов

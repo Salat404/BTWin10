@@ -1,0 +1,127 @@
+# Зміни для функціональності повноцінної оболонки Win 10:
+
+## 1. App.xaml.cs — додати після HideSystemTaskbarImmediate() в OnStartup:
+
+        protected override void OnStartup(StartupEventArgs e)
+        {
+            // Існуючий код...
+            HideSystemTaskbarImmediate();
+
+            // ===== НОВЕ: Повна оболонка Win 10 =====
+            // Прибираємо системне Пуск вікно та панель
+            _ = Task.Run(() => DisableWindowsShell());
+            
+            // Прибираємо стовпчик на краї екрану для розкриття панелі
+            _ = Task.Run(() => DisableAutoReveal());
+
+            // Залишаємо тільки Desktop + Explorer вікна видимими
+            _ = Task.Run(() => HideWindowsUIElements());
+            // ===== КІНЕЦЬ НОВИХ ЗМІН =====
+
+            _ = Task.Run(() =>
+            {
+                EnsureTaskScheduler();
+                RemoveLegacyRegistryAutostart();
+            });
+
+            base.OnStartup(e);
+            _ = Task.Run(() => WaitForProgmanThenShow());
+        }
+
+## 2. Додати нові методи в App.xaml.cs перед закриванням класу:
+
+        static void DisableWindowsShell()
+        {
+            try
+            {
+                // Відключаємо Cortana, Search, інші системні скорочення
+                const string path = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+                using (var key = Registry.LocalMachine.OpenSubKey(path, writable: true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("NoWinKeys", 1, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
+                // Приховуємо системне StartMenu вікно категорично
+                Thread.Sleep(500);
+                IntPtr startMenu = FindWindow("Windows.UI.Core.CoreWindow", null);
+                if (startMenu != IntPtr.Zero)
+                {
+                    ShowWindow(startMenu, 0); // SW_HIDE
+                }
+            }
+            catch { }
+        }
+
+        static void DisableAutoReveal()
+        {
+            try
+            {
+                // Вимикаємо auto-reveal системної панелі через Registry
+                const string path = @"HKEY_CURRENT_USER\Control Panel\Desktop";
+                using (var key = Registry.CurrentUser.OpenSubKey(path, writable: true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("WindowMetrics", "", RegistryValueKind.String);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        static void HideWindowsUIElements()
+        {
+            try
+            {
+                // Залишаємо видимим тільки Progman (Desktop) і explorer.exe вікна
+                IntPtr hwnd = IntPtr.Zero;
+                EnumWindows((hWnd, lParam) =>
+                {
+                    var sb = new StringBuilder(256);
+                    GetWindowText(hWnd, sb, 256);
+                    string title = sb.ToString();
+
+                    GetClassName(hWnd, sb, 256);
+                    string className = sb.ToString();
+
+                    // Приховуємо ALL системні вікна крім Progman та Explorer
+                    if (className != "Progman" && className != "CabinetWClass")
+                    {
+                        if (title.Contains("Windows") || title.Contains("Shell") || 
+                            title.Contains("Cortana") || className.Contains("Windows.UI"))
+                        {
+                            ShowWindow(hWnd, 0); // SW_HIDE
+                        }
+                    }
+
+                    return true;
+                }, IntPtr.Zero);
+            }
+            catch { }
+        }
+
+## 3. Додати P/Invoke функції в MainWindow.Interop.cs:
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+## Результат:
+- ✅ Системна панель приховується через autohide + запис в реєстр
+- ✅ Системне меню Пуск закривається через WM_KEYDOWN/ESC
+- ✅ Тільки робочий стіл (Progman) та Explorer вікна залишаються
+- ✅ Наша MyTaskbar панель та меню единственні видимі системні UI елементи

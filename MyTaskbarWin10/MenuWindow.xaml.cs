@@ -96,10 +96,12 @@ namespace MyTaskbar
                     var hs = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
                     POINT p = hs.pt;
 
-                    bool overUs = IsOver(this, p)
-                        || (PreviewWindow != null && PreviewWindow.IsVisible && IsOver(PreviewWindow, p))
-                        || (TaskbarWindow != null && TaskbarWindow.IsVisible && IsOver(TaskbarWindow, p));
-
+                    bool overMenu     = IsOver(this, p);
+                    bool overPreview  = PreviewWindow != null && PreviewWindow.IsVisible && IsOver(PreviewWindow, p);
+                    bool overTaskbar  = TaskbarWindow != null && TaskbarWindow.IsVisible && IsOver(TaskbarWindow, p);
+                    
+                    bool overUs = overMenu || overPreview || overTaskbar;
+                    
                     if (!overUs)
                     {
                         Dispatcher.BeginInvoke(
@@ -199,13 +201,79 @@ namespace MyTaskbar
         // [UI-SCALE-MENU] Высота панели задач с учётом масштаба (40px × uiScale)
         double ScaledTaskbarH => 40.0 * _uiScale;
 
-        double VisibleTop => IsBottom
-            ? SystemParameters.PrimaryScreenHeight - ScaledTaskbarH - (ActualHeight > 0 ? ActualHeight : 500) - 8
-            : ScaledTaskbarH + 8;
+        // [SECONDARY-MENU] Прямоугольник монитора, с которого открыто меню (WPF DIP).
+        // null = использовать основной монитор (поведение по умолчанию).
+        System.Windows.Rect? _sourceMonitorRect = null;
+        DateTime _sourceMonitorSetAt = DateTime.MinValue;
+        bool _deactivatedFromSecondary = false;
+        public System.Windows.Rect? SourceMonitorRect
+        {
+            get => _sourceMonitorRect;
+            set
+            {
+                _sourceMonitorRect = value;
+                if (value.HasValue)
+                {
+                    _sourceMonitorSetAt = DateTime.UtcNow;
+                    _deactivatedFromSecondary = true;
+                }
+                else
+                    _deactivatedFromSecondary = false;
+                // Сбросить кэш позиций при смене монитора
+                _hasCachedPositions = false;
+            }
+        }
 
-        double HiddenTop => IsBottom
-            ? SystemParameters.PrimaryScreenHeight + 4
-            : -((ActualHeight > 0 ? ActualHeight : 500) + 4);
+        // Вспомогательные свойства: высота и нижний край «нужного» монитора
+        double MonHeight => SourceMonitorRect.HasValue
+            ? SourceMonitorRect.Value.Height
+            : SystemParameters.PrimaryScreenHeight;
+
+        double MonBottom => SourceMonitorRect.HasValue
+            ? SourceMonitorRect.Value.Bottom
+            : SystemParameters.PrimaryScreenHeight;
+
+        double MonTop => SourceMonitorRect.HasValue
+            ? SourceMonitorRect.Value.Top
+            : 0;
+
+        double MonLeft => SourceMonitorRect.HasValue
+            ? SourceMonitorRect.Value.Left
+            : 0;
+
+        double MonWidth => SourceMonitorRect.HasValue
+            ? SourceMonitorRect.Value.Width
+            : SystemParameters.PrimaryScreenWidth;
+
+        double _visibleTopCache;
+        double _hiddenTopCache;
+        bool _hasCachedPositions = false;
+
+        double VisibleTop
+        {
+            get
+            {
+                if (!_hasCachedPositions)
+                    return IsBottom
+                        ? MonBottom - ScaledTaskbarH - (ActualHeight > 0 ? ActualHeight : 500) - 4
+                        : MonTop + ScaledTaskbarH + 4;
+                return _visibleTopCache;
+            }
+            set => _visibleTopCache = value;
+        }
+
+        double HiddenTop
+        {
+            get
+            {
+                if (!_hasCachedPositions)
+                    return IsBottom
+                        ? MonBottom + 4
+                        : MonTop - ((ActualHeight > 0 ? ActualHeight : 500) + 4);
+                return _hiddenTopCache;
+            }
+            set => _hiddenTopCache = value;
+        }
 
         // Устанавливается из MainWindow перед ShowMenu()
         public bool IsBottom { get; set; } = false;
@@ -311,6 +379,9 @@ namespace MyTaskbar
         public const double ANIM_SHOW_MS = 180;
         public const double ANIM_HIDE_MS = 130;
 
+        /// <summary>Если false — ShowMenu/HideAnimated мгновенно без анимации.</summary>
+        public bool AnimEnabled { get; set; } = true;
+
         bool _isAnimating = false;
         bool _initialized = false;
         bool _isShown = false; // true когда меню видно или анимируется к видимому состоянию
@@ -400,7 +471,15 @@ namespace MyTaskbar
             Deactivated += (s, e) =>
             {
                 if ((DateTime.UtcNow - _lastClickInside).TotalMilliseconds < 200) return;
-                if (!_isShown) return; // [FIX-FLICKER] уже скрыто или скрывается — игнорируем
+                if (!_isShown) return;
+                // [SECONDARY-MENU] Если меню открыто вторичной панелью (флаг установлен)
+                // и прошло менее 300 мс — это обычная раб процедура открытия меню
+                // Deactivated вызван RaiseEvent(), а не реальным уходом фокуса
+                if (_deactivatedFromSecondary && (DateTime.UtcNow - _sourceMonitorSetAt).TotalMilliseconds < 300)
+                {
+                    Debug.WriteLine("[MenuWindow.Deactivated] открыто с вторичного монитора — пропускаем HideAnimated");
+                    return;
+                }
                 HideAnimated();
             };
 
@@ -447,11 +526,53 @@ namespace MyTaskbar
         void PositionWindow()
         {
             UpdateLayout();
-            // [UI-SCALE-POS] Центрирование меню по экрану с учётом DPI.
-            // SystemParameters.PrimaryScreenWidth уже в WPF DIP (device-independent units),
-            // ActualWidth тоже в DIP — делим в DIP-пространстве, деление на dpi не нужно.
-            double sw = SystemParameters.PrimaryScreenWidth;
-            Left = Math.Round((sw - ActualWidth) / 2.0);
+            // [SECONDARY-MENU] Центрирование меню по монитору, с которого открыли.
+            bool hasRect = SourceMonitorRect.HasValue;
+            string rectStr = hasRect ? SourceMonitorRect.Value.ToString() : "null";
+            double sw = MonWidth;
+            double sl = MonLeft;
+            double st = MonTop;
+            double sb = MonBottom;
+            double newLeft = Math.Round(sl + (sw - ActualWidth) / 2.0);
+
+            // [SECONDARY-MENU-FIX] Учитываем Top координату вторичного монитора при расчёте HiddenTop и VisibleTop
+            double newHiddenTop, newVisibleTop;
+            if (hasRect)
+            {
+                // Для вторичного монитора: меню скрывается над верхним краем экрана
+                newHiddenTop = st - ActualHeight;
+                // Меню показывается ниже панели задач на вторичном мониторе С ОТСТУПОМ 4px
+                newVisibleTop = IsBottom 
+                    ? sb - ScaledTaskbarH - (ActualHeight > 0 ? ActualHeight : 500) - 4
+                    : st + ScaledTaskbarH + 4;  // ДОБАВЛЕН ОТСТУП + 4
+            }
+            else
+            {
+                // Первичный монитор — старое поведение
+                newHiddenTop = HiddenTop;
+                newVisibleTop = VisibleTop;
+            }
+
+            Debug.WriteLine("[MenuWindow.PositionWindow]"
+                + " SourceMonitorRect=" + rectStr
+                + " MonLeft=" + sl.ToString("F1") + " MonWidth=" + sw.ToString("F1")
+                + " ActualWidth=" + ActualWidth.ToString("F1")
+                + " Left=" + newLeft.ToString("F1") + " (было " + Left.ToString("F1") + ")");
+            Debug.WriteLine("[MenuWindow.PositionWindow]"
+                + " IsBottom=" + IsBottom
+                + " MonTop=" + st.ToString("F1") + " MonBottom=" + sb.ToString("F1")
+                + " ScaledTaskbarH=" + ScaledTaskbarH.ToString("F1") + " ActualH=" + ActualHeight.ToString("F1")
+                + " newHiddenTop=" + newHiddenTop.ToString("F1") + " newVisibleTop=" + newVisibleTop.ToString("F1"));
+
+            Left = newLeft;
+            // Обновляем позиции для вторичного монитора, если он установлен
+            if (hasRect)
+            {
+                _hasCachedPositions = true;
+                HiddenTop = newHiddenTop;
+                VisibleTop = newVisibleTop;
+                Top = newHiddenTop; // Начинаем с скрытой позиции
+            }
         }
 
         // ══════════════════════════════════════════════════════════════
@@ -460,6 +581,9 @@ namespace MyTaskbar
 
         public void ShowMenu()
         {
+            string smr = SourceMonitorRect.HasValue ? SourceMonitorRect.Value.ToString() : "null";
+            Debug.WriteLine("[MenuWindow.ShowMenu] вызван. SourceMonitorRect=" + smr + " IsBottom=" + IsBottom);
+
             if (_isAnimating) StopAllAnimations();
 
             PositionWindow();
@@ -489,6 +613,17 @@ namespace MyTaskbar
 
             BeginAnimation(TopProperty, null);
             Top = fromTop;
+
+            // [MENU-ANIM] Если анимация отключена — сразу на финальную позицию
+            if (!AnimEnabled)
+            {
+                Top = toTop;
+                _isAnimating = false;
+                PutBelowTaskbar();
+                Activate();
+                MenuPositionReady?.Invoke();
+                return;
+            }
 
             var ease = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 4 };
             var aSlide = new DoubleAnimation(fromTop, toTop, TimeSpan.FromMilliseconds(ANIM_SHOW_MS))
@@ -541,12 +676,29 @@ namespace MyTaskbar
             // HideAnimated повторно пока анимация скрытия ещё идёт (дёрганье)
             _isShown = false;
             MenuVisibilityChanged?.Invoke(false);
+            // [SECONDARY-MENU] Сбрасываем источник монитора — следующий ShowMenu
+            // будет позиционироваться по свежеустановленному rect (или по null = монитор 1)
+            SourceMonitorRect = null;
+            Debug.WriteLine("[MenuWindow.HideAnimated] SourceMonitorRect сброшен в null");
 
             if (_isAnimating) StopAllAnimations();
 
             _isAnimating = true;
             double fromTop = Top;
             double toTop = HiddenTop;
+
+            // [MENU-ANIM] Если анимация отключена — мгновенно убираем за экран
+            if (!AnimEnabled)
+            {
+                Top = toTop;
+                _isAnimating = false;
+                IsFullscreenMode = false;
+                var hwnd2 = new WindowInteropHelper(this).Handle;
+                if (hwnd2 != IntPtr.Zero)
+                    SetWindowPos(hwnd2, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+                MenuHideCompleted?.Invoke();
+                return;
+            }
 
             var ease = new ExponentialEase { EasingMode = EasingMode.EaseIn, Exponent = 4 };
             var aSlide = new DoubleAnimation(fromTop, toTop, TimeSpan.FromMilliseconds(ANIM_HIDE_MS))

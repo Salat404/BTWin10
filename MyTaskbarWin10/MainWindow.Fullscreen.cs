@@ -56,31 +56,37 @@ namespace MyTaskbar
                 { _edgeCursorEnteredAt = DateTime.MinValue; _edgeRevealPending = false; return; }
             }
             catch { }
-            var src2 = PresentationSource.FromVisual(this);
-            double dpi = src2?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+            // [FIX-2.9] _currentDpiScale кэшируется при WM_DPICHANGED, не пересчитываем каждые 50мс
+            double dpi = _currentDpiScale;
             double taskbarLeft = Left * dpi;
             double taskbarRight = taskbarLeft + ActualWidth * dpi;
+            var (monLeft2, monTop2, monWidth2, monHeight2) = GetPrimaryMonitorRectDip();
             bool atEdge = _isBottom
-                ? cp.y >= (int)(SystemParameters.PrimaryScreenHeight * dpi) - 2 && cp.x >= taskbarLeft && cp.x <= taskbarRight
-                : cp.y <= 2 && cp.x >= taskbarLeft && cp.x <= taskbarRight;
+                ? cp.y >= (int)((monTop2 + monHeight2) * dpi) - 2 && cp.x >= taskbarLeft && cp.x <= taskbarRight
+                : cp.y <= (int)(monTop2 * dpi) + 2 && cp.x >= taskbarLeft && cp.x <= taskbarRight;
             if (atEdge)
             {
                 if (_edgeCursorEnteredAt == DateTime.MinValue) _edgeCursorEnteredAt = DateTime.UtcNow;
                 // [ATTENTION-HIDE] Панель уже показана из-за attention — edge reveal не нужен,
                 // иначе _isHiddenByFullscreen сбросится и панель не спрячется после.
-                // [EDGE-DELAY] Показываем панель только после 1500 мс удержания курсора у края
+                // [EDGE-DELAY] Show taskbar only after holding cursor at edge for _revealDelayMs
                 if (!_edgeRevealPending && !_shownByAttention
-                    && (DateTime.UtcNow - _edgeCursorEnteredAt).TotalMilliseconds >= 1500)
+                    && (DateTime.UtcNow - _edgeCursorEnteredAt).TotalMilliseconds >= _revealDelayMs)
                 {
                     _edgeRevealPending = true;
                     _isHiddenByFullscreen = false;
                     _fullscreenConfirmCount = 0;
                     _notFullscreenConfirmCount = 0;
                     bool fps = IsCursorCapturedByFpsGame();
+                    // [FULLSCREEN-AUTOHIDE] Панель показана через edge reveal — запоминаем,
+                    // чтобы авто-скрыть если курсор уйдёт через 400мс
+                    _shownByEdgeReveal = true;
                     ShowTaskbar(animate: true, onComplete: () =>
                     {
                         // [GAME-4] Edge reveal в FPS — блокер сразу после появления панели
                         if (fps) ShowFullscreenBlocker();
+                        // [FULLSCREEN-AUTOHIDE] После анимации — запускаем таймер скрытия
+                        if (!IsMouseOver) StartFullscreenNoMouseHideTimer();
                     });
                 }
             }
@@ -104,17 +110,14 @@ namespace MyTaskbar
         {
             if (_taskbarAnimating) return;
             if (!_fullscreenAutoHide) return; // user disabled auto-hide in settings
-            bool anyOwnVisible = (_menuWindow != null && _menuWindow.IsVisible)
-                              || (_trayWindow != null && _trayWindow.IsOpen)
-                              || (_wifiWindow != null && _wifiWindow.IsVisible)
-                              || (_previewWindow != null && _previewWindow.IsVisible);
+            // [FIX-2.6] Единый метод вместо дублирования
+            bool anyOwnVisible = AnyOwnPopupVisible();
             bool fs = IsForegroundFullscreen();
             if (fs && _menuWindow != null && _menuWindow.IsVisible)
             {
                 IntPtr fg = GetForegroundWindow();
-                IntPtr hMenu = IntPtr.Zero, hTaskbar = IntPtr.Zero;
-                try { hMenu = new WindowInteropHelper(_menuWindow).Handle; } catch { }
-                try { hTaskbar = new WindowInteropHelper(this).Handle; } catch { }
+                // [FIX-2.2] Используем кэшированные HWND вместо new WindowInteropHelper
+                IntPtr hMenu = _menuHwnd, hTaskbar = _myHwnd;
                 if (fg != hMenu && fg != hTaskbar && fg == _lastFullscreenHwnd && !IsInOwnActivityGrace())
                     _menuWindow.HideAnimated();
             }
@@ -208,10 +211,8 @@ namespace MyTaskbar
                 int msg = wParam.ToInt32();
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN)
                 {
-                    // Проверяем: клик внутри панели? Если нет — скрываем.
-                    System.Runtime.InteropServices.Marshal.PtrToStructure(
-                        lParam, typeof(POINT)); // просто читаем
-                    var pt = (POINT)System.Runtime.InteropServices.Marshal.PtrToStructure(lParam, typeof(POINT));
+                    // [FIX-2.1] Один вызов вместо двух (мёртвый первый вызов убран)
+                    var pt = Marshal.PtrToStructure<POINT>(lParam);
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
                         try
@@ -247,9 +248,12 @@ namespace MyTaskbar
             {
                 if (hwnd == IntPtr.Zero || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) return false;
                 if (!GetWindowRect(hwnd, out RECT r)) return false;
-                int sw = (int)SystemParameters.PrimaryScreenWidth;
-                int sh = (int)SystemParameters.PrimaryScreenHeight;
-                return r.left <= 4 && r.top <= 4 && r.right >= sw - 4 && r.bottom >= sh - 4;
+                var src = PresentationSource.FromVisual(this);
+                double dpi = src?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+                var (monLeft, monTop, monWidth, monHeight) = GetPrimaryMonitorRectDip();
+                int ml = (int)(monLeft * dpi), mt = (int)(monTop * dpi);
+                int mr = ml + (int)(monWidth * dpi), mb = mt + (int)(monHeight * dpi);
+                return r.left <= ml + 4 && r.top <= mt + 4 && r.right >= mr - 4 && r.bottom >= mb - 4;
             }
             catch { return false; }
         }
@@ -263,15 +267,21 @@ namespace MyTaskbar
                 if (DesktopWindowClasses.Contains(GetWindowClass(hwnd))) return false;
                 // [FIX-D3DPROXY] Proxy/overlay окна не считаются fullscreen-окнами
                 if (IgnoredWindowClasses.Contains(GetWindowClass(hwnd))) return false;
-                try { if (hwnd == new WindowInteropHelper(this).Handle) return false; } catch { }
-                if (_menuWindow != null) try { if (hwnd == new WindowInteropHelper(_menuWindow).Handle) return false; } catch { }
-                if (_previewWindow != null) try { if (hwnd == new WindowInteropHelper(_previewWindow).Handle) return false; } catch { }
-                if (_trayWindow != null) try { if (hwnd == new WindowInteropHelper(_trayWindow).Handle) return false; } catch { }
-                if (_wifiWindow != null) try { if (hwnd == new WindowInteropHelper(_wifiWindow).Handle) return false; } catch { }
+                // [FIX-2.2] Используем кэшированные HWND вместо new WindowInteropHelper на каждый вызов
+                if (_myHwnd != IntPtr.Zero && hwnd == _myHwnd) return false;
+                if (_menuHwnd != IntPtr.Zero && hwnd == _menuHwnd) return false;
+                if (_previewHwnd != IntPtr.Zero && hwnd == _previewHwnd) return false;
+                if (_trayHwnd != IntPtr.Zero && hwnd == _trayHwnd) return false;
+                if (_wifiHwnd != IntPtr.Zero && hwnd == _wifiHwnd) return false;
                 GetWindowThreadProcessId(hwnd, out uint pid); if (pid == 0) return false;
                 string pn = "";
+                // [FIX-2.10] Кэшируем имя процесса чтобы не звать GetProcessById каждые 400мс
                 if (!_pidNameCache.TryGetValue(pid, out pn))
+                {
                     try { pn = Process.GetProcessById((int)pid).ProcessName?.ToLowerInvariant() ?? ""; } catch { }
+                    if (!string.IsNullOrEmpty(pn) && _pidNameCache.Count < 256)
+                        _pidNameCache.TryAdd(pid, pn);
+                }
                 if (string.Equals(pn, "explorer", StringComparison.OrdinalIgnoreCase)) return false;
                 if (IgnoredProcesses.Contains(pn)) return false;
                 // [STAB-4] SafeGetWindowText
@@ -283,8 +293,12 @@ namespace MyTaskbar
                 int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
                 if ((exStyle & WS_EX_TOOLWINDOW) != 0 && (exStyle & WS_EX_APPWINDOW) == 0) return false;
                 if (!GetWindowRect(hwnd, out RECT r)) return false;
-                int sw = (int)SystemParameters.PrimaryScreenWidth, sh = (int)SystemParameters.PrimaryScreenHeight;
-                if (r.left > 4 || r.top > 4 || r.right < sw - 4 || r.bottom < sh - 4) return false;
+                var srcFs = PresentationSource.FromVisual(this);
+                double dpiFs = srcFs?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+                var (fsMonLeft, fsMonTop, fsMonW, fsMonH) = GetPrimaryMonitorRectDip();
+                int fsML = (int)(fsMonLeft * dpiFs), fsMT = (int)(fsMonTop * dpiFs);
+                int fsMR = fsML + (int)(fsMonW * dpiFs), fsMB = fsMT + (int)(fsMonH * dpiFs);
+                if (r.left > fsML + 4 || r.top > fsMT + 4 || r.right < fsMR - 4 || r.bottom < fsMB - 4) return false;
                 _lastFullscreenHwnd = hwnd; return true;
             }
             catch { return false; }
@@ -330,13 +344,13 @@ namespace MyTaskbar
         {
             try
             {
-                var myHwnd = new WindowInteropHelper(this).Handle;
-                if (myHwnd == IntPtr.Zero) return;
+                // [FIX-2.2] Используем кэшированный HWND
+                if (_myHwnd == IntPtr.Zero) return;
 
                 IntPtr fgHwnd = GetForegroundWindow();
-                if (fgHwnd == IntPtr.Zero || fgHwnd == myHwnd) return;
+                if (fgHwnd == IntPtr.Zero || fgHwnd == _myHwnd) return;
 
-                uint myTid = GetWindowThreadProcessId(myHwnd, IntPtr.Zero);
+                uint myTid = GetWindowThreadProcessId(_myHwnd, IntPtr.Zero);
                 uint fgTid = GetWindowThreadProcessId(fgHwnd, IntPtr.Zero);
 
                 // Присоединяем наш поток к потоку игры — теперь SetForegroundWindow работает
@@ -349,7 +363,7 @@ namespace MyTaskbar
                 try
                 {
                     AllowSetForegroundWindow((uint)System.Diagnostics.Process.GetCurrentProcess().Id);
-                    SetForegroundWindow(myHwnd);
+                    SetForegroundWindow(_myHwnd);
                     // Снимаем ClipCursor ПОСЛЕ того как мы в фокусе
                     ClipCursor(IntPtr.Zero);
                 }
@@ -416,10 +430,9 @@ namespace MyTaskbar
                     hwndUnder = GetAncestor(hwndUnder, GA_ROOT);
 
                 // Проверяем: это наше собственное окно?
-                bool isOwn = false;
-                try { isOwn = hwndUnder == new WindowInteropHelper(this).Handle; } catch { }
-                if (!isOwn && _menuWindow != null)
-                    try { isOwn |= hwndUnder == new WindowInteropHelper(_menuWindow).Handle; } catch { }
+                // [FIX-2.2] Кэшированные HWND
+                bool isOwn = (_myHwnd != IntPtr.Zero && hwndUnder == _myHwnd)
+                          || (_menuHwnd != IntPtr.Zero && hwndUnder == _menuHwnd);
 
                 if (!isOwn && hwndUnder != IntPtr.Zero && hwndUnder != _lastFullscreenHwnd
                     && IsWindowVisible(hwndUnder))
@@ -461,9 +474,107 @@ namespace MyTaskbar
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] SuspendBlockerForAppWindow: {ex.Message}"); }
         }
 
+        // ═════════════════════════════════════════════════════════════════════
+        // [FULLSCREEN-AUTOHIDE] Win10-style: панель в fullscreen скрывается сама,
+        // если курсор не вернулся за 400мс после того как ушёл с панели.
+        // Срабатывает только когда панель показана в fullscreen (_shownByAttention
+        // или _shownByEdgeReveal), то есть не в обычном режиме.
+        // ═════════════════════════════════════════════════════════════════════
+
+        void StartFullscreenNoMouseHideTimer()
+        {
+            StopFullscreenNoMouseHideTimer();
+            _fullscreenNoMouseHideTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(Math.Max(100, _hideDelayMs))
+            };
+            _fullscreenNoMouseHideTimer.Tick += (_, _t) =>
+            {
+                _fullscreenNoMouseHideTimer.Stop();
+                _fullscreenNoMouseHideTimer = null;
+                SafeRun(CheckAndAutoHideInFullscreen, "FullscreenNoMouseHide");
+            };
+            _fullscreenNoMouseHideTimer.Start();
+            Debug.WriteLine($"[FULLSCREEN-AUTOHIDE] Timer started ({_hideDelayMs}ms)");
+        }
+
+        void StopFullscreenNoMouseHideTimer()
+        {
+            if (_fullscreenNoMouseHideTimer == null) return;
+            _fullscreenNoMouseHideTimer.Stop();
+            _fullscreenNoMouseHideTimer = null;
+            Debug.WriteLine("[FULLSCREEN-AUTOHIDE] Timer cancelled");
+        }
+
+        void CheckAndAutoHideInFullscreen()
+        {
+            // Скрываем только если панель реально была показана в fullscreen-режиме
+            if (!_shownByAttention && !_shownByEdgeReveal) return;
+            if (Visibility != Visibility.Visible || _taskbarAnimating) return;
+            // Курсор над панелью или дочерним окном? Тогда не прячем.
+            if (IsMouseOver) return;
+            if (IsCursorOverOwnWindows()) { StartFullscreenNoMouseHideTimer(); return; }
+            // [FIX-2.6] Единый метод вместо дублирования
+            if (AnyOwnPopupVisible()) { StartFullscreenNoMouseHideTimer(); return; }
+
+            Debug.WriteLine("[FULLSCREEN-AUTOHIDE] No cursor for 400ms — hiding taskbar");
+
+            bool wasEdge = _shownByEdgeReveal;
+            _shownByEdgeReveal = false;
+
+            if (_shownByAttention)
+            {
+                // Если показана из-за attention — скрываем как обычно
+                _shownByAttention = false;
+                UninstallAttentionMouseHook();
+                _isHiddenByFullscreen = true;
+                HideTaskbar(animate: true);
+            }
+            else if (wasEdge)
+            {
+                // Если показана через edge reveal — возвращаем в fullscreen-скрытое состояние
+                _isHiddenByFullscreen = true;
+                _edgeRevealPending = false;
+                HideTaskbar(animate: true);
+            }
+        }
+
+        // Вызывается из MainWindow.xaml.cs когда курсор заходит/выходит с панели
+        void OnTaskbarMouseEnterFullscreen()
+        {
+            if (!_shownByAttention && !_shownByEdgeReveal) return;
+            StopFullscreenNoMouseHideTimer();
+            Debug.WriteLine("[FULLSCREEN-AUTOHIDE] Cursor on taskbar — timer cancelled");
+        }
+
+        void OnTaskbarMouseLeaveFullscreen()
+        {
+            if (!_shownByAttention && !_shownByEdgeReveal) return;
+            // [FIX-2.5] Используем поле вместо new DispatcherTimer при каждом MouseLeave —
+            // предотвращает накопление таймеров при быстром движении курсора
+            _mouseLeaveCheckTimer?.Stop();
+            _mouseLeaveCheckTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+            _mouseLeaveCheckTimer.Tick += (_, _t) =>
+            {
+                _mouseLeaveCheckTimer?.Stop();
+                _mouseLeaveCheckTimer = null;
+                if (IsCursorOverOwnWindows())
+                {
+                    Debug.WriteLine("[FULLSCREEN-AUTOHIDE] Cursor moved to own child window — not hiding");
+                    return;
+                }
+                StartFullscreenNoMouseHideTimer();
+                Debug.WriteLine("[FULLSCREEN-AUTOHIDE] Cursor left taskbar — timer started");
+            };
+            _mouseLeaveCheckTimer.Start();
+        }
+
         void HideTaskbar(bool animate = false)
         {
             if (_taskbarAnimating) return;
+            // [FULLSCREEN-AUTOHIDE] Сбрасываем флаг edge reveal и останавливаем таймер
+            _shownByEdgeReveal = false;
+            StopFullscreenNoMouseHideTimer();
             _wifiWindow?.Hide(); HidePreview();
             // [GAME-5] Снимаем блокер курсора вместе с панелью
             _blockerWindow?.HideBlocker();
@@ -481,9 +592,10 @@ namespace MyTaskbar
         void HideTaskbarCore(bool animate)
         {
             if (_taskbarAnimating) return;
+            var (_, monTop, _, monHeight) = GetPrimaryMonitorRectDip();
             double hiddenTop = _isBottom
-                ? SystemParameters.PrimaryScreenHeight + 4
-                : -(TASKBAR_HEIGHT + 4);
+                ? monTop + monHeight + 4
+                : monTop - (TASKBAR_HEIGHT + 4);
             if (animate)
             {
                 _taskbarAnimating = true;
@@ -500,20 +612,22 @@ namespace MyTaskbar
         {
             if (_taskbarAnimating) return;
             Topmost = true;
-            // [ATTENTION-NOACTIVATE] Если noActivate=true — не крадём фокус у игры
-            if (!noActivate)
-            {
-                // Забираем фокус у игры через AttachThreadInput — снимает Raw Input CS2/TF2/Minecraft
+            // [FIX-2.12] StealFocusFromGame только если курсор реально захвачен FPS-игрой.
+            // Вызов при любом ShowTaskbar ломал фокус у обычных fullscreen-приложений.
+            if (!noActivate && IsCursorCapturedByFpsGame())
                 StealFocusFromGame();
-            }
+
+            // [PRIMARY-MONITOR] Позиционируем относительно выбранного монитора
+            var (monLeft, monTop, monWidth, monHeight) = GetPrimaryMonitorRectDip();
             var src2 = PresentationSource.FromVisual(this);
             double dpi = src2?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
-            double screenPx2 = Math.Round(SystemParameters.PrimaryScreenWidth * dpi);
+            double screenPx2 = Math.Round(monWidth * dpi);
             double panelPx2 = Math.Round(ActualWidth * dpi);
-            Left = Math.Floor((screenPx2 - panelPx2) / 2.0) / dpi;
+            Left = monLeft + Math.Floor((screenPx2 - panelPx2) / 2.0) / dpi;
+
             SafeRun(ApplyAcrylicBackground, "ApplyAcrylicBackground_Show");
-            double visibleTop = _isBottom ? SystemParameters.PrimaryScreenHeight - TASKBAR_HEIGHT : 0;
-            double hiddenTop = _isBottom ? SystemParameters.PrimaryScreenHeight + 4 : -(TASKBAR_HEIGHT + 4);
+            double visibleTop = _isBottom ? monTop + monHeight - TASKBAR_HEIGHT : monTop;
+            double hiddenTop  = _isBottom ? monTop + monHeight + 4              : monTop - (TASKBAR_HEIGHT + 4);
             if (animate)
             {
                 _taskbarAnimating = true;

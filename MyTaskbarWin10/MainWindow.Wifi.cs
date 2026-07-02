@@ -48,7 +48,14 @@ namespace MyTaskbar
                 var st = GetNetworkStatus();
                 WifiIcon.Text = st.Icon;
                 WifiIcon.Foreground = st.Active ? Brushes.White : new SolidColorBrush(Color.FromRgb(130, 130, 130));
-                if (WifiButton != null) WifiButton.ToolTip = st.Tooltip;
+                if (WifiButton != null)
+                {
+                    WifiButton.ToolTip = st.Tooltip;
+                    // [FIX] Кнопка кликабельна если адаптер присутствует (даже без подключения),
+                    // чтобы пользователь мог открыть список сетей и подключиться.
+                    // Кнопка отключается только если WiFi-адаптера вообще нет.
+                    WifiButton.IsEnabled = st.AdapterPresent;
+                }
             }
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] UpdateWifiIcon: {ex.Message}"); }
         }
@@ -96,13 +103,15 @@ namespace MyTaskbar
             });
         }
 
-        struct NetworkStatus { public string Icon; public string Tooltip; public bool Active; }
+        struct NetworkStatus { public string Icon; public string Tooltip; public bool Active; public bool AdapterPresent; }
 
         NetworkStatus GetNetworkStatus()
         {
             try
             {
                 var ifaces = NetworkInterface.GetAllNetworkInterfaces();
+
+                // Ethernet с реальным IP — высший приоритет
                 foreach (var ni in ifaces)
                 {
                     if (ni.OperationalStatus != OperationalStatus.Up) continue;
@@ -113,26 +122,69 @@ namespace MyTaskbar
                               || ni.NetworkInterfaceType == NetworkInterfaceType.FastEthernetT
                               || ni.NetworkInterfaceType == NetworkInterfaceType.FastEthernetFx;
                     if (isEth && HasRealIP(ni))
-                        return new NetworkStatus { Icon = "\uE839", Tooltip = $"Ethernet: {ni.Name}", Active = true };
+                        return new NetworkStatus { Icon = "\uE839", Tooltip = $"Ethernet: {ni.Name}", Active = true, AdapterPresent = true };
                 }
+
+                // Ищем WiFi-адаптеры (любое состояние — чтобы знать присутствует ли адаптер)
+                NetworkInterface wifiConnected = null;   // Up + реальный IP
+                NetworkInterface wifiUp = null;          // Up, но нет IP (модем включён, сеть не выбрана)
+                NetworkInterface wifiAny = null;         // адаптер есть, но выключен
+
                 foreach (var ni in ifaces)
                 {
-                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
                     if (ni.NetworkInterfaceType != NetworkInterfaceType.Wireless80211) continue;
-                    if (HasRealIP(ni))
-                    {
-                        int s = _cachedWifiSignal >= 0 ? _cachedWifiSignal : 50;
-                        string ss = _cachedWifiSignal >= 0 ? $"{s}%" : "…";
-                        return new NetworkStatus { Icon = SignalToIcon(s), Tooltip = $"Wi-Fi · signal {ss}", Active = true };
-                    }
-                    return new NetworkStatus { Icon = "\uF384", Tooltip = "No Internet connection", Active = false };
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+
+                    wifiAny = ni; // фиксируем что адаптер вообще есть
+
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (wifiUp == null) wifiUp = ni;
+
+                    if (HasRealIP(ni)) { wifiConnected = ni; break; }
                 }
-                return new NetworkStatus { Icon = "\uF384", Tooltip = "No network connections", Active = false };
+
+                if (wifiConnected != null)
+                {
+                    // Подключён и есть IP → белая, активная
+                    int s = _cachedWifiSignal >= 0 ? _cachedWifiSignal : 50;
+                    string ss = _cachedWifiSignal >= 0 ? $"{s}%" : "…";
+                    return new NetworkStatus { Icon = SignalToIcon(s), Tooltip = $"Wi-Fi · signal {ss}", Active = true, AdapterPresent = true };
+                }
+                if (wifiUp != null)
+                {
+                    // [FIX] Адаптер включён (Up), но нет подключения к сети / нет IP.
+                    // Active = false → иконка серая, НО AdapterPresent = true → кнопка кликабельна
+                    // (пользователь должен иметь возможность открыть список сетей и подключиться)
+                    return new NetworkStatus { Icon = "\uF384", Tooltip = "Wi-Fi: not connected (click to view networks)", Active = false, AdapterPresent = true };
+                }
+                if (wifiAny != null)
+                {
+                    // Адаптер физически присутствует, но нет ассоциации с сетью
+                    // (точка выключилась, сигнал пропал, ассоциация разорвана).
+                    // OperationalStatus = Down/NotPresent здесь означает «нет точки», а не
+                    // «адаптер аппаратно выключен» — пользователь должен иметь возможность
+                    // открыть список сетей и подключиться к другой.
+                    // Исключение: явно Disabled через диспетчер устройств / ncpa.cpl →
+                    // в этом случае блокируем кнопку.
+                    bool hardDisabled = wifiAny.OperationalStatus == OperationalStatus.NotPresent
+                                     || wifiAny.OperationalStatus == OperationalStatus.LowerLayerDown;
+                    return new NetworkStatus
+                    {
+                        Icon = "\uF384",
+                        Tooltip = hardDisabled ? "Wi-Fi adapter disabled" : "Wi-Fi: disconnected (click to view networks)",
+                        Active = false,
+                        AdapterPresent = !hardDisabled   // кликабельна если адаптер жив
+                    };
+                }
+
+                // Нет вообще никакого WiFi-адаптера
+                return new NetworkStatus { Icon = "\uF384", Tooltip = "No network connections", Active = false, AdapterPresent = false };
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"[MyTaskbar] GetNetworkStatus: {ex.Message}");
-                return new NetworkStatus { Icon = "\uF384", Tooltip = "Network unavailable", Active = false };
+                return new NetworkStatus { Icon = "\uF384", Tooltip = "Network unavailable", Active = false, AdapterPresent = false };
             }
         }
 
@@ -163,6 +215,8 @@ namespace MyTaskbar
                 if (_wifiWindow == null)
                 {
                     _wifiWindow = new WifiWindow(); _wifiWindow.UIScale = _uiScale;
+                    // [FIX-2.2] Кэшируем HWND
+                    _wifiWindow.SourceInitialized += (_, _e) => SafeRun(RefreshOwnHwnds, nameof(RefreshOwnHwnds));
                     _wifiWindow.IsVisibleChanged += (s2, ev) => { if (!(bool)ev.NewValue) { _wifiClosedAt = DateTime.UtcNow; UpdateWifiIcon(); } };
                 }
                 if (_wifiWindow.IsVisible) { _wifiWindow.Hide(); return; }
@@ -170,6 +224,31 @@ namespace MyTaskbar
                 _wifiWindow.ShowAt(0, TASKBAR_HEIGHT + 2);
             }
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] WifiButton_Click: {ex.Message}"); }
+        }
+
+        // [FIX-SECONDARY-POS] Открываем WiFi-окно позиционированное на втором мониторе.
+        // Параметры: monRight/monBottom/monTop/monWidth — границы второго монитора в DIP,
+        // taskbarH — высота панели в DIP, isBottom — панель снизу или сверху.
+        public void OpenWifiFromSecondary(double monLeft, double monRight, double monBottom,
+                                          double monTop, double taskbarH, bool isBottom)
+        {
+            try
+            {
+                MarkOwnActivity();
+                if ((DateTime.UtcNow - _wifiClosedAt).TotalMilliseconds < 300) return;
+                if (_wifiWindow == null)
+                {
+                    _wifiWindow = new WifiWindow(); _wifiWindow.UIScale = _uiScale;
+                    _wifiWindow.SourceInitialized += (_, _e) => SafeRun(RefreshOwnHwnds, nameof(RefreshOwnHwnds));
+                    _wifiWindow.IsVisibleChanged += (s2, ev) =>
+                    { if (!(bool)ev.NewValue) { _wifiClosedAt = DateTime.UtcNow; UpdateWifiIcon(); } };
+                }
+                if (_wifiWindow.IsVisible) { _wifiWindow.Hide(); return; }
+                _wifiWindow.IsBottom = isBottom;
+                // [FIX-SECONDARY-POS] ShowAtMonitor знает правильные границы монитора
+                _wifiWindow.ShowAtMonitor(monLeft, monRight, monTop, monBottom, taskbarH, isBottom);
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] OpenWifiFromSecondary: {ex.Message}"); }
         }
 
     }

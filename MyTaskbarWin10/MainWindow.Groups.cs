@@ -74,6 +74,15 @@ namespace MyTaskbar
                     // [STAB-4] Безопасный GetWindowText
                     string title = SafeGetWindowText(hWnd);
                     if (string.IsNullOrWhiteSpace(title) || title == "Program Manager") return true;
+                    
+                    // [FIX-DRAG-GHOST] Игнорируем временные окна драга с именами вроде "OleDropTargetWindow" или пустым текстом
+                    // которые создаёт Windows при перетаскивании файлов на рабочий стол
+                    string wndClassCheck = GetWindowClass(hWnd);
+                    if (!string.IsNullOrEmpty(wndClassCheck) && 
+                        (wndClassCheck.Contains("OleDropTargetWindow") || 
+                         wndClassCheck.Contains("DragWindow") ||
+                         wndClassCheck == "CLIPBRDWND"))
+                        return true;
 
                     // [FIX-D3DPROXY] Фильтр по window class — убирает служебные/proxy-окна
                     // (D3DProxyWindow, GameOverlayWindow и т.п.) которые рендер-движки и Steam
@@ -102,6 +111,14 @@ namespace MyTaskbar
                     }
 
                     if (string.IsNullOrEmpty(exeName)) return true;
+                    
+                    // [FIX-EXPLORER-GHOST] Для Explorer: очень короткие titles (1-4 символа) это служебные окна
+                    // которые создаются при drag&drop операциях на рабочий стол
+                    if (exeName == "explorer" && !string.IsNullOrEmpty(title) && title.Length < 5)
+                    {
+                        return true;  // Пропускаем служебное окно
+                    }
+                    
                     if (IgnoredProcesses.Contains(exeName)) return true;
                     if (ProcessAliases.TryGetValue(exeName, out string alias)) exeName = alias;
 
@@ -385,7 +402,8 @@ namespace MyTaskbar
                 catch { }
             }
             foreach (var aliasKey in aliasesToRemove)
-                try { _groups.Remove(aliasKey); } catch { }
+                // [FIX-2.4] Чистим PID-кэш
+                try { if (_groups.TryGetValue(aliasKey, out var ag)) CleanPidCacheForGroup(ag); _groups.Remove(aliasKey); } catch { }
             foreach (var exe in toRemove)
             {
                 try
@@ -393,6 +411,8 @@ namespace MyTaskbar
                     if (_groups.TryGetValue(exe, out var g))
                     {
                         if (g.IconHash != null) _iconHashToGroupKey.Remove(g.IconHash); // [ICON-HASH]
+                        // [FIX-2.4] Чистим PID-кэш для удалённой группы
+                        CleanPidCacheForGroup(g);
                         _groups.Remove(exe); needLayout = true; RemoveButtonAnimated(g.Button, g);
                     }
                 }

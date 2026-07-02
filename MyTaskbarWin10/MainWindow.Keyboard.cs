@@ -181,6 +181,74 @@ namespace MyTaskbar
         void MarkOwnActivity() => _ownWindowActivityAt = DateTime.UtcNow;
         bool IsInOwnActivityGrace() => (DateTime.UtcNow - _ownWindowActivityAt).TotalMilliseconds < OWN_ACTIVITY_GRACE_MS;
 
+        // [FIX-2.6] Единый метод проверки открытых попапов — используется в CheckFullscreen
+        // и CheckAndAutoHideInFullscreen вместо дублированных списков условий
+        bool AnyOwnPopupVisible() =>
+            (_menuWindow   != null && _menuWindow.IsVisible)    ||
+            (_trayWindow   != null && _trayWindow.IsOpen)       ||
+            (_wifiWindow   != null && _wifiWindow.IsVisible)    ||
+            (_previewWindow!= null && _previewWindow.IsVisible) ||
+            (_brightnessFlyout != null && _brightnessFlyout.IsVisible) ||
+            (_volumeFlyout != null && _volumeFlyout.IsVisible) ||
+            (_calendarWindow != null && _calendarWindow.IsVisible);
+
+        // [FIX-2.2] Обновляет кэш HWND при создании/показе дочерних окон.
+        // Вызывается из EnsureMenuWindow, InitPreviewWindow и т.п.
+        void RefreshOwnHwnds()
+        {
+            try
+            {
+                if (_myHwnd == IntPtr.Zero)
+                    try { _myHwnd = new WindowInteropHelper(this).Handle; } catch { }
+                if (_menuWindow != null)
+                    try { _menuHwnd = new WindowInteropHelper(_menuWindow).Handle; } catch { }
+                if (_previewWindow != null)
+                    try { _previewHwnd = new WindowInteropHelper(_previewWindow).Handle; } catch { }
+                if (_trayWindow != null)
+                    try { _trayHwnd = new WindowInteropHelper(_trayWindow).Handle; } catch { }
+                if (_wifiWindow != null)
+                    try { _wifiHwnd = new WindowInteropHelper(_wifiWindow).Handle; } catch { }
+            }
+            catch { }
+        }
+
+        // [FIX-2.4] Удаляет PID из кэшей когда группа (процесс) больше не нужна.
+        // Предотвращает накопление мёртвых PID в _pidNameCache/_pidPathCache.
+        void CleanPidCacheForGroup(AppGroup g)
+        {
+            if (g == null) return;
+            try
+            {
+                var pidsToCheck = new HashSet<uint>();
+                foreach (var hwnd in g.Hwnds)
+                {
+                    GetWindowThreadProcessId(hwnd, out uint p);
+                    if (p != 0) pidsToCheck.Add(p);
+                }
+                foreach (var pid in pidsToCheck)
+                {
+                    // Удаляем из кэша только если этот PID больше не используется другими группами
+                    bool stillUsed = false;
+                    foreach (var gr in _groups.Values)
+                    {
+                        if (gr == g) continue;
+                        foreach (var h in gr.Hwnds)
+                        {
+                            GetWindowThreadProcessId(h, out uint p2);
+                            if (p2 == pid) { stillUsed = true; break; }
+                        }
+                        if (stillUsed) break;
+                    }
+                    if (!stillUsed)
+                    {
+                        _pidNameCache.TryRemove(pid, out _);
+                        _pidPathCache.TryRemove(pid, out _);
+                    }
+                }
+            }
+            catch { }
+        }
+
         bool IsCursorOverOwnWindows()
         {
             try

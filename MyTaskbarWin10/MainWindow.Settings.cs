@@ -31,40 +31,153 @@ namespace MyTaskbar
         // ═════════════════════════════════════════════════════════════════════
         // СОХРАНЕНИЕ / ЗАГРУЗКА ПОЗИЦИИ ПАНЕЛИ
         // ═════════════════════════════════════════════════════════════════════
+        // [FIX-2.3] Единый JSON-файл настроек вместо 7 отдельных .txt файлов.
+        // Атомарная запись через temp + rename предотвращает порчу файла при сбое.
+        static readonly string _settingsDir = IOPath.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MyTaskbar");
         static readonly string _settingsPath = IOPath.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "MyTaskbar", "settings.json");
+        // Старый путь — для миграции
+        static readonly string _settingsPathLegacy = IOPath.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "MyTaskbar", "settings.xml");
 
-        void SavePosition()
+        // ── Единое сохранение всех настроек ───────────────────────────────────
+        void SaveAllSettings()
         {
             try
             {
-                string dir = IOPath.GetDirectoryName(_settingsPath);
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                string posLine = _isBottom ? "bottom" : "top";
-                string scaleLine = _uiScale.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                File.WriteAllText(_settingsPath, posLine + "\n" + scaleLine);
+                if (!Directory.Exists(_settingsDir)) Directory.CreateDirectory(_settingsDir);
+                string ic = System.Globalization.CultureInfo.InvariantCulture.NumberFormat.NumberDecimalSeparator;
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine($"  \"position\": \"{(_isBottom ? "bottom" : "top")}\",");
+                sb.AppendLine($"  \"uiScale\": {_uiScale.ToString(System.Globalization.CultureInfo.InvariantCulture)},");
+                sb.AppendLine($"  \"fullscreenAutoHide\": {(_fullscreenAutoHide ? "true" : "false")},");
+                sb.AppendLine($"  \"revealDelayMs\": {_revealDelayMs},");
+                sb.AppendLine($"  \"previewDelayMs\": {_previewDelayMs},");
+                sb.AppendLine($"  \"hideDelayMs\": {_hideDelayMs},");
+                sb.AppendLine($"  \"attentionShow\": {(_attentionShowEnabled ? "true" : "false")},");
+                sb.AppendLine($"  \"menuAnim\": {(_menuAnimEnabled ? "true" : "false")},");
+                sb.AppendLine($"  \"batteryIndicator\": {(_batteryIndicatorEnabled ? "true" : "false")},");
+                sb.AppendLine($"  \"primaryMonitorDevice\": \"{_primaryMonitorDevice.Replace("\\", "\\\\")}\"");
+                sb.AppendLine("}");
+                // Атомарная запись: сначала во временный файл, потом rename
+                string tmp = _settingsPath + ".tmp";
+                File.WriteAllText(tmp, sb.ToString(), System.Text.Encoding.UTF8);
+                File.Replace(tmp, _settingsPath, null);
             }
-            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] SavePosition: {ex.Message}"); }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] SaveAllSettings: {ex.Message}"); }
         }
 
+        // ── Обратная совместимость: делегаты вызывают единый SaveAllSettings ──
+        void SavePosition()            => SaveAllSettings();
+        void SaveUIScale()             => SaveAllSettings();
+        void SaveFullscreenAutoHide()  => SaveAllSettings();
+        void SaveRevealDelay()         => SaveAllSettings();
+        void SavePreviewDelay()        => SaveAllSettings();
+        void SaveHideDelay()           => SaveAllSettings();
+        void SaveAttentionShow()       => SaveAllSettings();
+        void SavePrimaryMonitor()      => SaveAllSettings();
+
+        // ── Единая загрузка всех настроек ─────────────────────────────────────
         void LoadPosition()
         {
             try
             {
-                if (!File.Exists(_settingsPath)) return;
-                string[] lines = File.ReadAllText(_settingsPath).Trim().Split('\n');
-                if (lines.Length > 0 && lines[0].Trim() == "bottom") _isBottom = true;
-                if (lines.Length > 1)
+                // Пробуем новый JSON
+                if (File.Exists(_settingsPath))
                 {
-                    if (double.TryParse(lines[1].Trim(), System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture, out double s))
-                    {
-                        _uiScale = Math.Max(1.0, Math.Min(1.5, Math.Round(s, 2)));
-                    }
+                    LoadAllSettingsFromJson(_settingsPath);
+                    return;
+                }
+                // Миграция: читаем старый settings.xml (на самом деле plain-text)
+                if (File.Exists(_settingsPathLegacy))
+                {
+                    string[] lines = File.ReadAllText(_settingsPathLegacy).Trim().Split('\n');
+                    if (lines.Length > 0 && lines[0].Trim() == "bottom") _isBottom = true;
+                    if (lines.Length > 1)
+                        if (double.TryParse(lines[1].Trim(), System.Globalization.NumberStyles.Float,
+                            System.Globalization.CultureInfo.InvariantCulture, out double s))
+                            _uiScale = Math.Max(1.0, Math.Min(1.5, Math.Round(s, 2)));
+                    // Мигрируем остальные .txt-настройки и сразу сохраняем в JSON
+                    MigrateLegacySettings();
+                    SaveAllSettings();
                 }
             }
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] LoadPosition: {ex.Message}"); }
+        }
+
+        // Простой ручной JSON-парсер — не тянет зависимости (Newtonsoft/System.Text.Json)
+        void LoadAllSettingsFromJson(string path)
+        {
+            try
+            {
+                string json = File.ReadAllText(path, System.Text.Encoding.UTF8);
+                string Get(string key)
+                {
+                    // Ищем "key": value — value может быть числом, bool или строкой
+                    int i = json.IndexOf($"\"{key}\"", StringComparison.Ordinal);
+                    if (i < 0) return null;
+                    int colon = json.IndexOf(':', i + key.Length + 2);
+                    if (colon < 0) return null;
+                    int start = colon + 1;
+                    while (start < json.Length && (json[start] == ' ' || json[start] == '\t')) start++;
+                    bool quoted = start < json.Length && json[start] == '"';
+                    if (quoted) start++;
+                    int end = start;
+                    while (end < json.Length && json[end] != ',' && json[end] != '\n' && json[end] != '}'
+                           && (!quoted || json[end] != '"'  )) end++;
+                    return json.Substring(start, end - start).Trim().Trim('"');
+                }
+                string pos = Get("position");
+                if (pos == "bottom") _isBottom = true;
+                if (double.TryParse(Get("uiScale"), System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out double sc))
+                    _uiScale = Math.Max(1.0, Math.Min(1.5, Math.Round(sc, 2)));
+                string fah = Get("fullscreenAutoHide");
+                if (fah != null) _fullscreenAutoHide = (fah != "false" && fah != "0");
+                if (int.TryParse(Get("revealDelayMs"), out int rd))
+                    _revealDelayMs = Math.Max(0, Math.Min(3000, rd));
+                if (int.TryParse(Get("previewDelayMs"), out int pd))
+                    _previewDelayMs = Math.Max(0, Math.Min(2000, pd));
+                if (int.TryParse(Get("hideDelayMs"), out int hd))
+                    _hideDelayMs = Math.Max(100, Math.Min(5000, hd));
+                string attn = Get("attentionShow");
+                if (attn != null) _attentionShowEnabled = (attn != "false" && attn != "0");
+                string mnanim = Get("menuAnim");
+                if (mnanim != null) _menuAnimEnabled = (mnanim != "false" && mnanim != "0");
+                string batt = Get("batteryIndicator");
+                if (batt != null) _batteryIndicatorEnabled = (batt != "false" && batt != "0");
+                string pmd = Get("primaryMonitorDevice");
+                if (pmd != null) _primaryMonitorDevice = pmd.Replace("\\\\", "\\");
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] LoadAllSettingsFromJson: {ex.Message}"); }
+        }
+
+        // Миграция старых .txt файлов → поля перед записью в JSON
+        void MigrateLegacySettings()
+        {
+            try
+            {
+                string TryRead(string fname)
+                {
+                    string p = IOPath.Combine(_settingsDir, fname);
+                    return File.Exists(p) ? File.ReadAllText(p).Trim() : null;
+                }
+                string v;
+                if ((v = TryRead("fullscreen_hide.txt")) != null) _fullscreenAutoHide = (v != "0");
+                if ((v = TryRead("reveal_delay.txt")) != null && int.TryParse(v, out int rd))
+                    _revealDelayMs = Math.Max(0, Math.Min(3000, rd));
+                if ((v = TryRead("preview_delay.txt")) != null && int.TryParse(v, out int pd))
+                    _previewDelayMs = Math.Max(0, Math.Min(2000, pd));
+                if ((v = TryRead("hide_delay.txt")) != null && int.TryParse(v, out int hd))
+                    _hideDelayMs = Math.Max(100, Math.Min(5000, hd));
+                if ((v = TryRead("attention_show.txt")) != null) _attentionShowEnabled = (v != "0");
+                Debug.WriteLine("[MyTaskbar] Legacy settings migrated to settings.json");
+            }
+            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] MigrateLegacySettings: {ex.Message}"); }
         }
         void InitNotifyIcon()
         {
@@ -111,10 +224,14 @@ namespace MyTaskbar
             if (_settingsWindow != null && _settingsWindow.IsVisible)
             {
                 _settingsWindow.Activate();
+                _settingsWindow.Focus();
                 return;
             }
 
-            _settingsWindow = new SettingsWindow(_isBottom, _uiScale, _fullscreenAutoHide);
+            _settingsWindow = new SettingsWindow(_isBottom, _uiScale, _fullscreenAutoHide,
+                                                 _revealDelayMs, _previewDelayMs, _hideDelayMs,
+                                                 _attentionShowEnabled, _primaryMonitorDevice,
+                                                 _menuAnimEnabled, _batteryIndicatorEnabled);
 
             _settingsWindow.PositionChanged += (isBot) =>
             {
@@ -146,48 +263,134 @@ namespace MyTaskbar
                 SaveFullscreenAutoHide();
             };
 
-            // Position the window near the taskbar edge, horizontally centered
+            _settingsWindow.RevealDelayChanged += (ms) =>
+            {
+                _revealDelayMs = ms;
+                SaveRevealDelay();
+            };
+
+            _settingsWindow.PreviewDelayChanged += (ms) =>
+            {
+                _previewDelayMs = ms;
+                if (_previewShowTimer != null)
+                    _previewShowTimer.Interval = TimeSpan.FromMilliseconds(ms);
+                SavePreviewDelay();
+            };
+
+            _settingsWindow.HideDelayChanged += (ms) =>
+            {
+                _hideDelayMs = ms;
+                SaveHideDelay();
+            };
+
+            _settingsWindow.AttentionShowChanged += (enabled) =>
+            {
+                _attentionShowEnabled = enabled;
+                SaveAttentionShow();
+            };
+
+            _settingsWindow.MenuAnimChanged += (enabled) =>
+            {
+                _menuAnimEnabled = enabled;
+                if (_menuWindow != null) _menuWindow.AnimEnabled = enabled;
+                SaveAllSettings();
+            };
+
+            _settingsWindow.BatteryIndicatorChanged += (enabled) =>
+            {
+                _batteryIndicatorEnabled = enabled;
+                if (BatteryButton != null)
+                {
+                    BatteryButton.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
+                }
+                SaveAllSettings();
+            };
+
+            _settingsWindow.PrimaryMonitorChanged += (deviceName) =>
+            {
+                _primaryMonitorDevice = deviceName;
+                SavePrimaryMonitor();
+                // Перепозиционируем главную панель на выбранный монитор
+                Dispatcher.Invoke(() =>
+                {
+                    PositionTaskbar();
+                    ReserveScreenSpace();
+                });
+                // Уведомляем вторичную панель — она пересчитает свои мониторы
+                SafeRun(NotifySecondaryMonitorChanged, "NotifySecondaryMonitorChanged");
+            };
+
+            // Position the window near the taskbar edge, horizontally centered on selected monitor
             _settingsWindow.Loaded += (s, e) =>
             {
-                double sw = SystemParameters.PrimaryScreenWidth;
+                var (monLeft, monTop, monWidth, monHeight) = GetPrimaryMonitorRectDip();
                 double ww = _settingsWindow.ActualWidth;
                 double wh = _settingsWindow.ActualHeight;
-                _settingsWindow.Left = (sw - ww) / 2;
+                _settingsWindow.Left = monLeft + (monWidth - ww) / 2;
                 if (_isBottom)
-                    _settingsWindow.Top = SystemParameters.PrimaryScreenHeight - TASKBAR_HEIGHT - wh - 8;
+                    _settingsWindow.Top = monTop + monHeight - TASKBAR_HEIGHT - wh - 8;
                 else
-                    _settingsWindow.Top = TASKBAR_HEIGHT + 8;
+                    _settingsWindow.Top = monTop + TASKBAR_HEIGHT + 8;
             };
 
             _settingsWindow.Show();
         }
 
-        void SaveFullscreenAutoHide()
-        {
-            try
-            {
-                string dir = System.IO.Path.GetDirectoryName(_settingsPath);
-                if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
-                // Append/overwrite a separate file next to the main settings file
-                string path = System.IO.Path.Combine(dir, "fullscreen_hide.txt");
-                System.IO.File.WriteAllText(path, _fullscreenAutoHide ? "1" : "0");
-            }
-            catch { }
-        }
+        // [FIX-2.3] Разрозненные Save*/Load* методы заменены единым SaveAllSettings/LoadAllSettingsFromJson выше
+        // Stub'ы для обратной совместимости с вызовами из MainWindow_Loaded:
+        void LoadFullscreenAutoHide() { /* [FIX-2.3] Загружается в LoadPosition → LoadAllSettingsFromJson */ }
+        void LoadRevealDelay()        { /* [FIX-2.3] Загружается в LoadPosition → LoadAllSettingsFromJson */ }
+        void LoadPreviewDelay()       { /* [FIX-2.3] Загружается в LoadPosition → LoadAllSettingsFromJson */ }
+        void LoadHideDelay()          { /* [FIX-2.3] Загружается в LoadPosition → LoadAllSettingsFromJson */ }
+        void LoadAttentionShow()      { /* [FIX-2.3] Загружается в LoadPosition → LoadAllSettingsFromJson */ }
 
-        void LoadFullscreenAutoHide()
+        // ── Получить геометрию главного монитора (учитывает _primaryMonitorDevice) ──
+        // Возвращает координаты в физических пикселях.
+        // Если монитор не найден — возвращает системный primary.
+        (double left, double top, double width, double height) GetPrimaryMonitorRectDip()
         {
             try
             {
-                string dir = System.IO.Path.GetDirectoryName(_settingsPath);
-                string path = System.IO.Path.Combine(dir, "fullscreen_hide.txt");
-                if (System.IO.File.Exists(path))
+                var source = PresentationSource.FromVisual(this);
+                double dpi = source?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
+
+                var monitors = EnumerateMonitors();
+                RECT rc;
+
+                if (!string.IsNullOrEmpty(_primaryMonitorDevice))
                 {
-                    string v = System.IO.File.ReadAllText(path).Trim();
-                    _fullscreenAutoHide = (v != "0");
+                    // Ищем монитор по имени устройства
+                    foreach (var m in monitors)
+                    {
+                        if (string.Equals(m.name, _primaryMonitorDevice, StringComparison.OrdinalIgnoreCase))
+                        {
+                            rc = m.rc;
+                            return (rc.left / dpi, rc.top / dpi,
+                                    (rc.right - rc.left) / dpi,
+                                    (rc.bottom - rc.top) / dpi);
+                        }
+                    }
                 }
+
+                // Fallback: системный primary (содержит флаг MONITORINFOF_PRIMARY)
+                foreach (var m in monitors)
+                {
+                    if (m.isPrimary)
+                    {
+                        rc = m.rc;
+                        return (rc.left / dpi, rc.top / dpi,
+                                (rc.right - rc.left) / dpi,
+                                (rc.bottom - rc.top) / dpi);
+                    }
+                }
+
+                // Крайний fallback — SystemParameters
+                return (0, 0, SystemParameters.PrimaryScreenWidth, SystemParameters.PrimaryScreenHeight);
             }
-            catch { }
+            catch
+            {
+                return (0, 0, SystemParameters.PrimaryScreenWidth, SystemParameters.PrimaryScreenHeight);
+            }
         }
 
         void ToggleTaskbarPosition()
@@ -216,6 +419,9 @@ namespace MyTaskbar
                 _appNotifyIcon.Text = _isBottom
                     ? "MyTaskbar — taskbar at bottom  (click → move to top)"
                     : "MyTaskbar — taskbar at top (click → move to bottom)";
+
+            // [SECONDARY] Синхронизируем позицию второй панели
+            SafeRun(NotifySecondaryPositionChanged, "NotifySecondaryPositionChanged");
         }
 
         // [UI-SCALE] Изменить масштаб панели и всех всплывающих окон.
@@ -249,38 +455,31 @@ namespace MyTaskbar
             if (_volumeFlyout != null) _volumeFlyout.UIScale = _uiScale;
             if (_wifiWindow != null) _wifiWindow.UIScale = _uiScale;
             if (_brightnessFlyout != null) _brightnessFlyout.UIScale = _uiScale;
+
+            // [SECONDARY] Синхронизируем масштаб второй панели
+            SafeRun(NotifySecondaryScaleChanged, "NotifySecondaryScaleChanged");
         }
 
-        void SaveUIScale()
-        {
-            try
-            {
-                string dir = IOPath.GetDirectoryName(_settingsPath);
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                string posLine = _isBottom ? "bottom" : "top";
-                string scaleLine = _uiScale.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                File.WriteAllText(_settingsPath, posLine + "\n" + scaleLine);
-            }
-            catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] SaveUIScale: {ex.Message}"); }
-        }
+        // SaveUIScale() — делегат → SaveAllSettings() (см. выше)
 
         void ReserveScreenSpace()
         {
             try
             {
-                // [FIX-WORKAREA-DPI] SPI_SETWORKAREA требует физические пиксели, а не WPF DIP.
-                // SystemParameters.PrimaryScreenWidth/Height — в DIP, нужно умножить на DPI.
-                // TASKBAR_HEIGHT тоже в DIP — тоже умножаем.
-                // Иначе при DPI > 96 (125%, 150%) right/bottom оказываются меньше экрана
-                // и maximized-окна (Chrome, Edge) получают зазор справа и сверху.
+                // [PRIMARY-MONITOR] Используем выбранный монитор
                 var source = PresentationSource.FromVisual(this);
                 double dpi = source?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
-                int swPx = (int)Math.Round(SystemParameters.PrimaryScreenWidth * dpi);
-                int shPx = (int)Math.Round(SystemParameters.PrimaryScreenHeight * dpi);
+
+                var (monLeft, monTop, monWidth, monHeight) = GetPrimaryMonitorRectDip();
+                int mlPx = (int)Math.Round(monLeft   * dpi);
+                int mtPx = (int)Math.Round(monTop    * dpi);
+                int mrPx = (int)Math.Round((monLeft + monWidth)  * dpi);
+                int mbPx = (int)Math.Round((monTop  + monHeight) * dpi);
                 int thPx = (int)Math.Round(TASKBAR_HEIGHT * dpi);
+
                 RECT wa = _isBottom
-                    ? new RECT { left = 0, top = 0, right = swPx, bottom = shPx - thPx }
-                    : new RECT { left = 0, top = thPx, right = swPx, bottom = shPx };
+                    ? new RECT { left = mlPx, top = mtPx,  right = mrPx, bottom = mbPx - thPx }
+                    : new RECT { left = mlPx, top = mtPx + thPx, right = mrPx, bottom = mbPx };
                 SystemParametersInfo(SPI_SETWORKAREA, 0, ref wa, 0x01 | 0x02);
             }
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] ReserveScreenSpace: {ex.Message}"); }
@@ -362,6 +561,16 @@ namespace MyTaskbar
                 // [GAME-11] Восстанавливаем блокер если FPS захватил курсор
                 if (fps) ShowFullscreenBlocker();
                 _menuWindow.IsBottom = _isBottom;
+                // [SECONDARY-MENU] Сбрасываем SourceMonitorRect ТОЛЬКО если Secondary его не выставил.
+                // Если Secondary уже установил rect — значит клик пришёл оттуда, не трогаем.
+                if (!_menuWindow.SourceMonitorRect.HasValue)
+                {
+                    // Клик с основного монитора: rect уже null, ничего не делаем
+                }
+                // rect будет сброшен в null самим MenuWindow после закрытия (см. ниже)
+                Debug.WriteLine("[MainWindow.StartButton_Click] SourceMonitorRect="
+                    + (_menuWindow.SourceMonitorRect.HasValue ? _menuWindow.SourceMonitorRect.Value.ToString() : "null")
+                    + " IsBottom=" + _menuWindow.IsBottom);
                 _menuWindow.ShowMenu();
             }
             catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] StartButton_Click: {ex.Message}"); }
@@ -390,8 +599,7 @@ namespace MyTaskbar
             // [ATTENTION] Shell hook
             try { DeregisterShellHookWindow(new WindowInteropHelper(this).Handle); } catch { }
 
-            // [FIX-TASKMGR-FOCUS] Хук фокуса — теперь в хелпере
-            TaskmgrWatcher.StopFocusGuard();
+            // [REMOVED] TaskmgrWatcher.StopFocusGuard - focus lock disabled
 
             // [STAB-5] Отписка WTS
             try { WTSUnRegisterSessionNotification(new WindowInteropHelper(this).Handle); } catch { }

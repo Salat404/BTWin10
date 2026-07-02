@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -62,6 +63,10 @@ namespace MyTaskbar
             SafeRun(LoadShortcuts, "LoadShortcuts");
             SafeRun(LoadPosition, "LoadPosition");   // загружаем позицию до PositionTaskbar
             SafeRun(LoadFullscreenAutoHide, "LoadFullscreenAutoHide");
+            SafeRun(LoadRevealDelay, "LoadRevealDelay");
+            SafeRun(LoadPreviewDelay, "LoadPreviewDelay");
+            SafeRun(LoadHideDelay, "LoadHideDelay");
+            SafeRun(LoadAttentionShow, "LoadAttentionShow");
             // [DPI-AUTO] Читаем начальный масштаб до первого PositionTaskbar
             try { var src0 = PresentationSource.FromVisual(this); _currentDpiScale = src0?.CompositionTarget?.TransformToDevice.M11 ?? 1.0; } catch { }
             // [UI-SCALE] Применяем сохранённый масштаб до первого PositionTaskbar
@@ -84,7 +89,7 @@ namespace MyTaskbar
             SafeRun(StartBrightnessIconTracker, "StartBrightnessIconTracker");
             SafeRun(StartBluetoothTracker, "StartBluetoothTracker");
             SafeRun(StartTaskbarWatcher, "StartTaskbarWatcher");
-            SafeRun(() => TaskmgrWatcher.StartFocusGuard(Dispatcher), "TaskmgrWatcher.StartFocusGuard"); // [FIX-TASKMGR-FOCUS]
+            // [REMOVED] TaskmgrWatcher.StartFocusGuard - focus lock disabled
             SafeRun(InstallKeyboardHook, "InstallKeyboardHook");
             SafeRun(StartFullscreenWatcher, "StartFullscreenWatcher");
             SafeRun(StartEdgeRevealWatcher, "StartEdgeRevealWatcher");
@@ -98,9 +103,19 @@ namespace MyTaskbar
             AppIcons.PreviewMouseMove           += AppIcons_DragMouseMove;
             AppIcons.PreviewMouseLeftButtonUp   += AppIcons_DragMouseUp;
             AppIcons.MouseLeave                 += AppIcons_DragMouseLeave;
+
+            // [FULLSCREEN-AUTOHIDE] Трекаем вход/выход курсора с панели
+            // для авто-скрытия в fullscreen-режиме (Win10-поведение)
+            this.MouseEnter += (_, _me) => SafeRun(OnTaskbarMouseEnterFullscreen, "OnTaskbarMouseEnterFullscreen");
+            this.MouseLeave += (_, _me) => SafeRun(OnTaskbarMouseLeaveFullscreen, "OnTaskbarMouseLeaveFullscreen");
+
+            // [FIX-2.2] Кэшируем HWND собственного окна один раз — используется в CheckFullscreen
+            try { _myHwnd = new WindowInteropHelper(this).Handle; } catch { }
         }
 
-        static void SafeRun(Action a, string n = "")
+        // [FIX-2.11] CallerMemberName — автоматически подставляет имя метода-вызывателя
+        // Если передать явное имя — использует его; если не передать — подставляет имя caller'а
+        static void SafeRun(Action a, [CallerMemberName] string n = "")
         { try { a(); } catch (Exception ex) { Debug.WriteLine($"[MyTaskbar] {n}: {ex}"); } }
 
         // ═════════════════════════════════════════════════════════════════════

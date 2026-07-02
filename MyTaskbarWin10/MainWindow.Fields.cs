@@ -103,6 +103,12 @@ namespace MyTaskbar
 
         // ── Позиция панели (верх / низ) ───────────────────────────────────────
         bool _isBottom = false;
+
+        // ── Выбор главного монитора ───────────────────────────────────────────
+        // 0 = системный primary (по умолчанию), 1..N = номер монитора в списке EnumerateMonitors
+        // _primaryMonitorDevice хранит szDevice выбранного монитора (\\.\\DISPLAY1 и т.д.)
+        // Пустая строка = использовать системный primary
+        string _primaryMonitorDevice = "";
         System.Windows.Forms.NotifyIcon _appNotifyIcon;
 
         // ── Settings window (Shift+Alt+O) ─────────────────────────────────────
@@ -115,6 +121,14 @@ namespace MyTaskbar
         WifiWindow _wifiWindow;
         // [GAME-2] Прозрачный блокер на весь экран — удерживает курсор пока панель видна
         FullscreenBlockerWindow _blockerWindow;
+
+        // [FIX-2.2] Кэшированные HWND собственных окон — обновляются при создании окна.
+        // Позволяют избежать new WindowInteropHelper() в горячих путях (CheckFullscreen, IsForegroundFullscreen).
+        IntPtr _myHwnd      = IntPtr.Zero;
+        IntPtr _menuHwnd    = IntPtr.Zero;
+        IntPtr _previewHwnd = IntPtr.Zero;
+        IntPtr _trayHwnd    = IntPtr.Zero;
+        IntPtr _wifiHwnd    = IntPtr.Zero;
 
         // ── Таймеры ───────────────────────────────────────────────────────────
         DispatcherTimer _clockTimer, _activeTimer, _langTimer, _batteryTimer,
@@ -157,6 +171,12 @@ namespace MyTaskbar
 
         // ── Прочее ────────────────────────────────────────────────────────────
         IntPtr _lastForegroundWindow = IntPtr.Zero;
+        // [FIX-NOACTIVATE-TOGGLE] Некоторые окна (напр. компактный/узкий Discord —
+        // Electron-виджет с focusable:false) не принимают реальный OS-фокус: SetForegroundWindow
+        // визуально поднимает их поверх, но GetForegroundWindow() продолжает показывать
+        // предыдущее окно (часто — сам таскбар). Поэтому храним, какое окно МЫ сами
+        // последним пытались активировать, и используем это как доп. признак "уже открыто".
+        IntPtr _lastActivatedByTaskbar = IntPtr.Zero;
         readonly string ShortcutsFolder;
 
         IntPtr _keyboardHook = IntPtr.Zero;
@@ -168,6 +188,9 @@ namespace MyTaskbar
         IntPtr _attentionMouseHook = IntPtr.Zero;  // [ATTENTION-HIDE] активен только в noActivate-режиме
         LowLevelMouseProc _attentionMouseProc;
         bool _shownByAttention = false;            // панель показана из-за attention во время fullscreen
+        bool _attentionShowEnabled = true;          // [SETTING] показывать панель когда программа требует внимания в fullscreen
+        bool _menuAnimEnabled = true;               // [SETTING] анимация открытия/закрытия меню Пуск
+        bool _batteryIndicatorEnabled = true;       // [SETTING] показывать индикатор батареи на панели
 
         volatile bool _winKeyDown;
         volatile bool _winUsedInCombo;
@@ -189,7 +212,8 @@ namespace MyTaskbar
         DateTime _ownWindowActivityAt = DateTime.MinValue;
         const int OWN_ACTIVITY_GRACE_MS = 1500;
         int _fullscreenConfirmCount = 0;
-        const int FULLSCREEN_CONFIRM_TICKS = 2;
+        // [FIX-2.8] 1 тик = 400мс — соответствует Win10 (было 2 = 800мс)
+        const int FULLSCREEN_CONFIRM_TICKS = 1;
         int _notFullscreenConfirmCount = 0;
         const int NOT_FULLSCREEN_CONFIRM_TICKS = 3;
 
@@ -201,6 +225,18 @@ namespace MyTaskbar
 
         DateTime _edgeCursorEnteredAt = DateTime.MinValue;
         bool _edgeRevealPending = false;
+
+        // [FULLSCREEN-AUTOHIDE] Таймер авто-скрытия панели если курсор ушёл с неё
+        // (Win10-поведение: панель появилась в fullscreen → курсор ушёл → 400мс → скрыть)
+        DispatcherTimer _fullscreenNoMouseHideTimer;
+        // [FIX-2.5] Таймер проверки MouseLeave — хранится в поле, не создаётся каждый раз
+        DispatcherTimer _mouseLeaveCheckTimer;
+        bool _shownByEdgeReveal = false;  // панель показана через edge reveal в fullscreen
+
+        // ── Configurable delays (ms) ────────────────────────────────────────
+        int _revealDelayMs  = 400;   // delay before taskbar appears from hidden state (edge hover)
+        int _previewDelayMs = 400;   // delay before thumbnail preview appears on hover
+        int _hideDelayMs    = 400;   // delay before taskbar auto-hides after cursor leaves (fullscreen)
 
         const int BT_SENTINEL = -99;
         int _btLastStateInt = BT_SENTINEL;

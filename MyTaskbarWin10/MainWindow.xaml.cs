@@ -117,7 +117,7 @@ namespace MyTaskbar
         // MainWindow.Fullscreen.cs   — edge reveal, fullscreen, FPS blocker
         // MainWindow.Groups.cs       — window group tracking (EnumWindows)
         // MainWindow.Media.cs        — brightness + volume controls
-        // MainWindow.Menu.cs         — menu window, button animation
+        // MainWindow.Menu.cs         — menu window, button animation, calendar popup
         // MainWindow.Keyboard.cs     — keyboard hook, Win key handling
         // MainWindow.TaskbarWatch.cs — taskbar watcher + shell restore
         // MainWindow.Wifi.cs         — Wi-Fi icon tracker

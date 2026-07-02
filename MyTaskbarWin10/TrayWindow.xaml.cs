@@ -253,6 +253,10 @@ namespace MyTaskbar
 
         double _pendingCenterX;
         double _pendingVisibleTop;
+        // [FIX-SECONDARY-POS] Границы монитора для корректного ограничения позиции.
+        // MainWindow устанавливает PrimaryScreenWidth по умолчанию; вторая панель передаёт свои.
+        public double MonLeft  { get; set; } = 0;
+        public double MonRight { get; set; } = 0; // 0 = не задано → использовать PrimaryScreenWidth
 
         // ── Конструктор ──────────────────────────────────────────────
         public TrayWindow()
@@ -477,25 +481,67 @@ namespace MyTaskbar
             string.Join("|", icons.Select(x => $"{x.ProcessId}:{x.AppID}"));
 
         // ── Единственная точка входа для обновления ──────────────────
-        // Вызывается из любого потока. Безопасно.
+        // Вызывается из любого потока (WM_PAINT тулбара, WM_SHELLHOOK, 1с-poll).
+        // [FIX-TRAY-DEBOUNCE] Раньше каждый вызов сразу плодил Task.Run — а WM_PAINT
+        // тулбара стреляет очень часто (не только при реальном добавлении/удалении
+        // иконки). Несколько триггеров подряд запускали параллельные GetTrayIcons()
+        // (каждый — OpenProcess + ReadProcessMemory в цикле), которые копились в
+        // пуле потоков и выполнялись вперемешку — отсюда нарастающая задержка после
+        // нескольких срабатываний вместо мгновенного отклика. Теперь: пачка триггеров
+        // за 150мс схлопывается в один запуск, и повторный запуск не стартует, пока
+        // предыдущий не закончился (а если за это время прилетел новый триггер —
+        // выполняется ровно один дозапуск после, без накопления очереди).
+        readonly object _refreshLock = new object();
+        System.Threading.Timer _refreshDebounceTimer;
+        bool _refreshRunning;
+        bool _refreshRerunRequested;
+        const int RefreshDebounceMs = 150;
+
         void TriggerIconRefresh()
         {
-            _ = Task.Run(() =>
+            lock (_refreshLock)
             {
-                try
-                {
-                    var icons = GetTrayIcons();
-                    var fp    = IconsFingerprint(icons);
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        if (fp == _lastIconsFingerprint) return; // ничего не изменилось
-                        _lastIconsFingerprint = fp;
-                        RenderIcons(icons);
-                    }));
-                }
-                catch { }
-            });
+                _refreshDebounceTimer?.Dispose();
+                _refreshDebounceTimer = new System.Threading.Timer(
+                    _ => RunIconRefresh(), null, RefreshDebounceMs, System.Threading.Timeout.Infinite);
+            }
         }
+
+        void RunIconRefresh()
+        {
+            lock (_refreshLock)
+            {
+                if (_refreshRunning) { _refreshRerunRequested = true; return; }
+                _refreshRunning = true;
+            }
+
+            try
+            {
+                var icons = GetTrayIcons();
+                var fp    = IconsFingerprint(icons);
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (fp == _lastIconsFingerprint) return; // ничего не изменилось
+                    _lastIconsFingerprint = fp;
+                    RenderIcons(icons);
+                }));
+            }
+            catch { }
+            finally
+            {
+                bool rerun;
+                lock (_refreshLock)
+                {
+                    _refreshRunning = false;
+                    rerun = _refreshRerunRequested;
+                    _refreshRerunRequested = false;
+                }
+                // Что-то изменилось, пока мы читали трей — перечитываем один раз,
+                // без нового debounce-ожидания.
+                if (rerun) _ = Task.Run(RunIconRefresh);
+            }
+        }
+
 
         void StartTrayPolling()
         {
@@ -532,6 +578,12 @@ namespace MyTaskbar
                     DeregisterShellHookWindow(hwnd);
             }
             catch { }
+
+            lock (_refreshLock)
+            {
+                _refreshDebounceTimer?.Dispose();
+                _refreshDebounceTimer = null;
+            }
 
             _trayCts?.Cancel();
             _trayCts = null;
@@ -583,13 +635,15 @@ namespace MyTaskbar
             InvalidateArrange();
             UpdateLayout();
 
-            double sw = SystemParameters.PrimaryScreenWidth;
+            // [FIX-SECONDARY-POS] Используем границы нужного монитора, а не всегда первого экрана
+            double monLeft  = MonLeft;
+            double monRight = MonRight > 0 ? MonRight : SystemParameters.PrimaryScreenWidth;
             double w  = ActualWidth  > 4 ? ActualWidth  : 80;
             double h  = ActualHeight > 4 ? ActualHeight : 80;
 
             double left = _pendingCenterX - w / 2;
-            if (left + w > sw - 4) left = sw - w - 4;
-            if (left < 4) left = 4;
+            if (left + w > monRight - 4) left = monRight - w - 4;
+            if (left < monLeft + 4)      left = monLeft + 4;
 
             Left = left;
             Top  = IsBottom
